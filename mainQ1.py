@@ -64,9 +64,6 @@ def solve_photometric_stereo(imgs, light_dirs):
 # that z(0,0) = 0 exactly (index 0 would include the reference pixel's own
 # gradient).
 def heights_from_normals(surface_normals):
-    # nz -> 0 only at a silhouette, where the surface is edge-on and therefore
-    # invisible, so it cannot occur inside these face crops. Checked: the
-    # smallest |nz| over the four datasets is 0.134 (B05), so no guard is needed.
     nz = surface_normals[:, :, 2]
 
     p = surface_normals[:, :, 0] / nz            # height change per column step
