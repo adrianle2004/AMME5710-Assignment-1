@@ -186,12 +186,69 @@ it would add the whole top row of `q` as a **per-column bias**, distorting the
 shape rather than just shifting it. With the slicing as written, `z(0,0) = 0`
 exactly for all three strategies.
 
-**Artefacts.** Strategy (a) streaks **vertically**, because the top row is a
-serial chain that every column hangs off — an error anywhere along it displaces
-that entire column and all columns after it. Strategy (b) streaks
-**horizontally** for the mirror-image reason. Because the two artefacts are
-orthogonal, averaging in (c) cross-cancels them and halves the noise variance,
-which is why (c) is used for the 3D renders.
+**Why the streaks appear, and why they run the way they do.**
+
+Write out strategy (a) explicitly for a pixel at row `r`, column `c`:
+
+```
+z_a[r, c]  =  Σ_{j=1..c} p[0, j]   +   Σ_{i=1..r} q[i, c]
+              ─────────────────       ─────────────────
+              along the top row       straight down column c
+```
+
+The second term is the important one: it is a cumulative sum **confined to
+column `c`**. Nothing in column `c` is ever compared against column `c ± 1`.
+The only thing the columns share is their single starting value from the top
+row. So the image is not really being integrated as a surface at all — it is
+192 independent one-dimensional integrations, run side by side, that happen to
+start from a common row.
+
+That has two consequences.
+
+*Down a column, the result is smooth.* Consecutive entries of a cumulative sum
+differ by exactly one gradient step, which is small.
+
+*Across columns, it is not.* Each column accumulates its own noise
+independently, so neighbouring columns drift apart and never get pulled back
+together — there is no mechanism in the algorithm that couples them. A
+cumulative sum is an integrator, so white noise in the gradients becomes a
+random walk in the height, and adjacent columns are performing *different*
+random walks.
+
+Smooth along the direction of integration, discontinuous across it, is exactly
+what a stripe is. Hence strategy (a), which integrates down columns, produces
+**vertical** streaks. Strategy (b) integrates along rows and gives
+**horizontal** streaks for the mirror-image reason.
+
+This is measurable. For B01, taking the RMS height step between neighbouring
+pixels:
+
+| | step down a column | step across a row | ratio |
+|---|---|---|---|
+| `z_a` (row first, then down) | 0.414 px | 0.819 px | **2.0×** |
+| `z_b` (column first, then across) | 0.639 px | 0.603 px | 0.9× |
+
+`z_a` is twice as rough across a row as it is down a column — the surface is
+continuous in the direction it was integrated and jumps sideways. `z_b` shows
+the reverse, though more weakly.
+
+The random-walk picture also predicts the streaks should worsen with distance
+from the seed row, since a random walk's spread grows as `√r`. The trend is
+there, but slower than `√r`:
+
+```
+z_a: RMS difference between adjacent columns
+   row  10:  0.65 px      row 100:  0.95 px
+   row  50:  0.52 px      row 190:  1.03 px
+```
+
+The growth is real but sub-`√r` because the gradient errors are not white noise
+— they are spatially correlated, coming from shared structure (shadow edges,
+the specular ridge of the nose) that affects neighbouring columns similarly and
+partly cancels in the difference.
+
+Because the two artefacts are orthogonal, averaging in (c) cross-cancels them
+and halves the noise variance, which is why (c) is used for the 3D renders.
 
 A pronounced global tilt survives in every reconstruction (best-fit plane slopes
 of 0.23–0.30 px/row). This is accumulated low-frequency drift from the running
@@ -201,26 +258,203 @@ in the assignment brief.
 
 ---
 
+### Step 3 — Outlier detection
+
+With `ρ` and `n` recovered for a pixel, and all 64 lighting directions known,
+the Lambertian model can **predict** how bright that pixel should have been in
+every image. The residual is measured minus predicted:
+
+```
+r_k(x,y) = I_k(x,y) − ρ(x,y) ( n(x,y) · l_k )
+```
+
+giving 64 residuals per pixel. Large ones mark observations the model cannot
+explain — cast shadows, specular highlights on the nose and forehead,
+inter-reflections around the eye sockets and nostrils: all the ways a real face
+fails to be Lambertian. The `g = ρn` substitution from Step 0 reappears here,
+used forwards instead of backwards, so the whole 64×192×168 prediction cube is
+a single matrix product with no loops.
+
+**The prediction is deliberately not clamped.** Physically the correct model is
+`ρ·max(n·l, 0)`, because a negative `n·l` means the light is behind the surface
+and the patch is unlit. But clamping defeats the purpose: inside a cast shadow
+the camera records ≈0 and a clamped model *also* predicts ≈0, so the two agree,
+the residual vanishes, and the shadow — the very thing being hunted — becomes
+invisible. Left un-clamped the model keeps predicting a brightly lit pixel
+against a measurement of zero, producing the large negative residual that flags
+it.
+
+**The threshold is per pixel, not global.**
+
+```python
+sigma = residuals.std(axis=0, keepdims=True)   # axis 0 = the 64 images
+return np.abs(residuals) > 2.0 * sigma
+```
+
+Collapsing `axis=0` leaves one standard deviation per pixel, computed from that
+pixel's own 64 residuals. This matters because residuals scale with albedo: a
+bright forehead has larger residuals than dark hair simply because it reflects
+more light, not because anything anomalous happened. A single global threshold
+would mostly flag "the bright parts of the face". The per-pixel version asks
+the right question instead — *is this observation unusual relative to the other
+63 of this same pixel?*
+
+**Montage.** One 8×8 figure per face, one panel per lighting condition. Flagged
+pixels are drawn in red over the image itself rather than as a bare binary
+mask, so it is possible to see *what* was rejected: shadow boundaries, the
+specular ridge of the nose, the dark side of the face under grazing light. Many
+exposures are very dark, so each panel is stretched to its own 99th percentile
+for display only — every calculation uses the raw values.
+
+---
+
+### Step 3b — Dead frames in B02
+
+Two B02 exposures failed outright:
+
+| frame | peak brightness | mean |
+|-------|-----------------|------|
+| `image_028` | 0.067 | 0.0246 |
+| `image_052` | 0.012 | 0.0007 |
+
+This is a capture fault, not a lighting effect. Dark frames are *normal* here:
+14 of the 64 lighting directions in every dataset point behind the subject
+(`l_z < 0`, up to 127° off the camera axis). But every other back-lit frame
+still peaks near 1.0 from a rim highlight — B01's `image_016` and B05's
+`image_025` both reach ≈1.0 at the same `l_z = −0.604` where B02's `image_028`
+caps at 0.067. Only these two never illuminate anything, and no other dataset
+contains any.
+
+They are therefore detected on **peak** brightness, not mean:
+
+```python
+def find_dead_frames(imgs, peak_thresh=0.25):
+    peaks = imgs.reshape(imgs.shape[0], -1).max(axis=1)
+    return peaks < peak_thresh
+```
+
+**They must be removed separately, before the residual test, because the 2σ
+rule does not reliably catch them.** `image_028` is caught (59.5% of its pixels
+flagged, rank 3 of 64). `image_052` is not: only **4.9% flagged, rank 26 of
+64**, barely above the 1.6% median. Its `l_z = −0.087` is nearly perpendicular
+to the camera axis, so the model already predicts almost no brightness for a
+front-facing pixel — measured ≈0, predicted ≈0, they agree, no residual. A
+failed capture whose lighting direction happens to predict darkness anyway is
+invisible to a residual test, while still biasing the least-squares solve with
+a row of zeros. The dead-frame mask is OR-ed into the outlier mask so those
+frames are excluded at every pixel.
+
+---
+
+### Step 4 — Re-solving without the outliers
+
+In Step 0 every pixel used all 64 images, so every pixel shared the same 64×3
+matrix `L` and one `lstsq` handled all 32,256 at once. After rejection **each
+pixel keeps a different subset**, so there is no shared matrix any more — every
+pixel has its own small least-squares problem.
+
+Looping over 32,256 pixels would work but is slow. Instead the weighted normal
+equations are formed, which are the closed-form solution of a weighted
+least-squares problem:
+
+```
+A g = b        A = Σ_k w_k l_k l_kᵀ        b = Σ_k w_k I_k l_k
+```
+
+with `w_k = 0` for a rejected observation and 1 otherwise. The useful property
+is that `A` is only 3×3 and each of its nine entries is a plain sum over `k`,
+which vectorises into one matrix–vector product across all pixels:
+
+```python
+for i in range(3):
+    for j in range(3):
+        A[:, i, j] = (light_dirs[:, i] * light_dirs[:, j]) @ W
+b = (W * I).T @ light_dirs
+```
+
+Nine products for the whole image. `np.linalg.solve` then handles a *stack* of
+matrices natively, so all 32,256 3×3 systems are solved in one call.
+
+A determinant check guards against pixels that lost too many views, or whose
+survivors all cluster in one direction, leaving `A` singular; those fall back
+to the unweighted solution rather than producing a blown-up normal that would
+propagate down an entire column of the `cumsum`. In practice **zero pixels**
+hit this on any of the four datasets — the fewest surviving views for any pixel
+was 48 of 64.
+
+**Measuring whether it helped.** There is no ground truth, so the disagreement
+between the two integration paths is used as a proxy:
+
+```python
+rms = np.sqrt(np.mean((z_a - z_b) ** 2))
+```
+
+For a true surface the gradient field is conservative and paths (a) and (b)
+must agree exactly; they diverge only to the extent the recovered normals
+violate `∂p/∂y = ∂q/∂x`. So `RMS |z_a − z_b|` is a self-consistency score for
+the normals — lower is more physically plausible.
+
+---
+
 ### Results
 
-| Subject | z(0,0), all three | Height range of z_c |
-|---------|-------------------|---------------------|
-| B01     | 0.0               | 105.9 px            |
-| B02     | 0.0               | 107.5 px            |
-| B05     | 0.0               | 63.4 px             |
-| B07     | 0.0               | 125.8 px            |
+**Baseline reconstruction.** `z(0,0) = 0` exactly for all three strategies on
+all four subjects, as required.
 
-```
-B01: z(0,0) = 0.0 0.0 0.0   height range = 105.9 px
-B02: z(0,0) = 0.0 0.0 0.0   height range = 107.5 px
-B05: z(0,0) = 0.0 0.0 0.0   height range =  63.4 px
-B07: z(0,0) = 0.0 0.0 0.0   height range = 125.8 px
-B01 check -> max albedo error 7.77e-16, max normal error 1.67e-15
-```
+| Subject | Height range of `z_c` |
+|---------|-----------------------|
+| B01     | 105.9 px              |
+| B02     | 107.5 px              |
+| B05     |  63.4 px              |
+| B07     | 125.8 px              |
 
-B05 is the hardest dataset: roughly half the height range of the others, and
-heavy chin and neck shadowing that breaks the Lambertian assumption over a large
-area.
+The B01 solve reproduces the supplied pre-computed pickle to **7.8e-16** in
+albedo and **1.7e-15** in the normals, i.e. machine precision.
+
+**Outlier rejection.**
+
+| Subject | flagged | fewest surviving views | normals moved (mean / max) | singular pixels |
+|---------|---------|------------------------|-----------------------------|-----------------|
+| B01     | 12.0 %  | 48 | 4.30° / 25.1° | 0 |
+| B02     | 12.8 %  | 50 | 4.51° / 37.6° | 0 |
+| B05     | 10.9 %  | 49 | 4.15° / 41.7° | 0 |
+| B07     | 12.2 %  | 50 | 4.15° / 30.5° | 0 |
+
+The largest normal changes land on the eyes, the nostrils and the specular
+ridge of the nose — exactly the regions where the Lambertian assumption is
+weakest.
+
+**Effect on path self-consistency**, `RMS |z_a − z_b|`:
+
+| Subject | baseline | after rejection | change |
+|---------|----------|-----------------|--------|
+| B01 |  7.28 px |  7.38 px | **+1.3 %** |
+| B02 | 22.10 px | 17.85 px | **−19.2 %** |
+| B05 | 16.09 px | 17.39 px | **+8.1 %** |
+| B07 | 11.94 px |  7.99 px | **−33.1 %** |
+
+(B02's figure was −12.8 % from the 2σ rule alone; removing the two dead frames
+as well took it to −19.2 %.)
+
+**Rejection is not uniformly beneficial**, and this is worth stating plainly
+rather than presenting it as a straight win. B07 and B02 improve substantially;
+B01 and B05 get marginally worse. The likely explanation is a conditioning
+trade-off. Discarding observations improves the quality of the data feeding
+each pixel, but it also narrows the cone of surviving lighting directions,
+which makes the 3×3 matrix `A` worse-conditioned and amplifies whatever noise
+remains. Where the data was already fairly clean, the conditioning loss
+outweighs the cleanup.
+
+It is also worth remembering what this metric does and does not measure. It is
+a *self-consistency* score — how nearly the recovered gradient field satisfies
+the integrability constraint — not accuracy against a ground-truth face, of
+which none is available. A reconstruction could in principle be smooth,
+self-consistent and wrong.
+
+B05 is the hardest dataset: roughly half the height range of the others, heavy
+chin and neck shadowing that breaks the Lambertian assumption over a large
+area, and the smallest `|n_z|` of the four (0.134) putting it closest to the
+gradient singularity.
 
 ---
 
@@ -249,6 +483,13 @@ the implementation follows the specified cumulative-sum strategies.
 python3 mainQ1.py
 ```
 
-Requires `numpy`, `opencv-python` and `matplotlib` only. Produces a 4×4 grid
-(one row per subject: albedo and the three height maps) followed by a 3D render
-of each face via the supplied `plot_face_3d`.
+Requires `numpy`, `opencv-python` and `matplotlib` only. Plots produced, in
+order:
+
+1. a 4×4 grid — one row per subject: albedo and the three height maps `z_a`,
+   `z_b`, `z_c`;
+2. four 8×8 outlier montages, one per subject, flagged pixels in red;
+3. a 4×3 before/after grid — baseline `z_c`, outlier-rejected `z_c`, and the
+   difference;
+4. 3D renders via the supplied `plot_face_3d`, baseline then outlier-rejected
+   for each face.
