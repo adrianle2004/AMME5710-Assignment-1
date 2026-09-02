@@ -258,6 +258,50 @@ in the assignment brief.
 
 ---
 
+### Step 2b — Rendering the model (from the week 2 tutorial)
+
+Exercise 1 of the week 2 tutorial rendered the face under each of the 64 lighting
+directions from the pre-supplied albedo and normals, and compared the render
+against the photograph. `render_images()` is that exercise, with the double
+`for` loop over all 32,256 pixels replaced by the single matrix product that
+computes the same thing:
+
+```python
+g = (albedo[:, :, None] * normals).reshape(h * w, 3)   # rho * n
+rendered = (light_dirs @ g.T).reshape(-1, h, w)        # all 64 images at once
+```
+
+`clamp=True` reproduces the tutorial exactly, flooring `n · l` at zero because a
+negative dot product means the light is behind the surface. The measured and
+rendered montages are plotted side by side for all four subjects.
+
+The differences are the point of the exercise. The renders have no specular
+highlight on the nose or forehead, no cast shadow from the nose across the
+cheek, no inter-reflection filling the eye sockets, and no saturation clipping —
+none of which a Lambertian model contains. Those same differences are what the
+residual test in Step 3 measures numerically.
+
+Each subject therefore gets three montages side by side — **measured**,
+**rendered**, and their **difference** — so the residual can be read directly
+against the image that produced it, before any thresholding is applied:
+
+| colour in the difference panel | meaning | cause |
+|---|---|---|
+| blue (measured darker than predicted) | the model says lit, the camera saw dark | cast and attached shadows |
+| red (measured brighter than predicted) | the model says dark, the camera saw bright | specular highlights, inter-reflection in the eye sockets and nostrils |
+| white | model and measurement agree | Lambertian assumption holding |
+
+A single symmetric colour scale, set to the 99.5th percentile of `|residual|`,
+is shared by all 64 panels so they can be compared against one another rather
+than each being stretched to its own range. The two dead B02 frames stand out
+immediately as solid blue panels: the camera recorded nothing, but the model
+still predicts a lit face.
+
+`montage()` is also taken from the tutorial: instead of 64 separate axes, the
+images are tiled into one large array and drawn with a single `imshow`. The
+panels then sit flush against each other, which makes neighbouring lighting
+conditions much easier to compare, and it draws far faster.
+
 ### Step 3 — Outlier detection
 
 With `ρ` and `n` recovered for a pixel, and all 64 lighting directions known,
@@ -308,7 +352,7 @@ for display only — every calculation uses the raw values.
 
 ---
 
-### Step 3b — Dead frames in B02
+### Step 3b — Dead frames in B02 (investigated, then disabled)
 
 Two B02 exposures failed outright:
 
@@ -333,16 +377,27 @@ def find_dead_frames(imgs, peak_thresh=0.25):
     return peaks < peak_thresh
 ```
 
-**They must be removed separately, before the residual test, because the 2σ
-rule does not reliably catch them.** `image_028` is caught (59.5% of its pixels
-flagged, rank 3 of 64). `image_052` is not: only **4.9% flagged, rank 26 of
-64**, barely above the 1.6% median. Its `l_z = −0.087` is nearly perpendicular
-to the camera axis, so the model already predicts almost no brightness for a
-front-facing pixel — measured ≈0, predicted ≈0, they agree, no residual. A
-failed capture whose lighting direction happens to predict darkness anyway is
-invisible to a residual test, while still biasing the least-squares solve with
-a row of zeros. The dead-frame mask is OR-ed into the outlier mask so those
-frames are excluded at every pixel.
+**This mechanism is commented out in the final code.** The question specifies
+the 2σ residual test and nothing else, so these two frames are left in and put
+through exactly the same test as every other image. `find_dead_frames` is kept
+commented in Part 1 because the behaviour below is worth reporting.
+
+What the residual test does with them is itself the interesting result.
+`image_028` is caught easily — 59.5% of its pixels flagged, rank 3 of 64 —
+because its lighting direction predicts a well-lit face, so the all-black
+measurement disagrees with the model everywhere. `image_052` largely escapes:
+only **4.9% flagged, rank 26 of 64**, barely above the 1.6% median. Its
+`l_z = −0.087` is nearly perpendicular to the camera axis, so the model already
+predicts almost no brightness for a front-facing pixel — measured ≈0,
+predicted ≈0, they agree, and no residual appears. A failed capture whose
+lighting direction happens to predict darkness anyway is invisible to a
+residual test, while the row of zeros still biases the least-squares solve.
+
+This is a genuine limitation of a purely residual-based criterion, and it is
+easily fixed by adding the peak test above to the rejection mask
+(`outliers | dead[:, None, None]`). Doing so takes B02's `RMS |z_a − z_b|`
+improvement from −12.8 % to −19.2 %. It is left out of the reported results
+because it goes beyond what the question specifies.
 
 ---
 
@@ -352,6 +407,11 @@ In Step 0 every pixel used all 64 images, so every pixel shared the same 64×3
 matrix `L` and one `lstsq` handled all 32,256 at once. After rejection **each
 pixel keeps a different subset**, so there is no shared matrix any more — every
 pixel has its own small least-squares problem.
+
+Both cases are handled by the one function, `solve_photometric_stereo(imgs,
+light_dirs, weights=None)`: with no weights it takes the shared-`lstsq` path of
+Step 0, and with a weight mask it takes the path below. Splitting `g` into
+`ρ = |g|` and `n = g/|g|` is identical either way, so it is written once.
 
 Looping over 32,256 pixels would work but is slow. Instead the weighted normal
 equations are formed, which are the closed-form solution of a weighted
@@ -396,6 +456,41 @@ the normals — lower is more physically plausible.
 
 ---
 
+### Step 5 — What rejection does to the albedo and normals
+
+Step 4 re-computes albedo and normals, and only then re-integrates. It is worth
+looking at those two quantities directly, before the change is propagated
+through `p`, `q` and the cumulative sums, because the pattern is clean and
+consistent across all four subjects.
+
+**The albedo rises almost everywhere.** The mean change is positive for every
+dataset (+0.042, +0.034, +0.029, +0.034 for B01, B02, B05, B07 — about 7–8 % of
+mean albedo). This is not an artefact; it follows from which observations get
+rejected. Shadows are far more common than specular highlights on a face, and a
+shadowed observation is a *spuriously dark* measurement. Least squares over all
+64 images averages those dark measurements in and pulls the estimated albedo
+down. Removing them lets the albedo rise to what the unshadowed observations
+alone imply.
+
+The exceptions are the regions that go the other way, shown in blue: the eyes,
+the eyebrows, hairline and the bridge of the nose. There the dominant outlier
+is a specular highlight — a *spuriously bright* measurement — so rejecting it
+lowers the albedo instead.
+
+**The normals move most at the eyes.** The per-pixel angular change between the
+old and new unit normal is near zero over most of the face (4.1–4.3° mean) but
+spikes to 25–42° in tight blobs on the corneas of every single subject, with
+smaller peaks at the nostrils and along the specular ridge of the nose. This is
+exactly what should be expected: the cornea is a wet, curved mirror and is the
+single most non-Lambertian surface on a face, so it is where the model was
+worst and where removing the offending observations changes the answer most.
+
+Three figures cover this: albedo before / after / difference plus the normal
+change map, then the normal X and Y components before and after (displayed as
+in the week 2 tutorial), then the height maps.
+
+---
+
 ### Results
 
 **Baseline reconstruction.** `z(0,0) = 0` exactly for all three strategies on
@@ -416,7 +511,7 @@ albedo and **1.7e-15** in the normals, i.e. machine precision.
 | Subject | flagged | fewest surviving views | normals moved (mean / max) | singular pixels |
 |---------|---------|------------------------|-----------------------------|-----------------|
 | B01     | 12.0 %  | 48 | 4.30° / 25.1° | 0 |
-| B02     | 12.8 %  | 50 | 4.51° / 37.6° | 0 |
+| B02     | 10.7 %  | 51 | 4.11° / 39.2° | 0 |
 | B05     | 10.9 %  | 49 | 4.15° / 41.7° | 0 |
 | B07     | 12.2 %  | 50 | 4.15° / 30.5° | 0 |
 
@@ -429,12 +524,12 @@ weakest.
 | Subject | baseline | after rejection | change |
 |---------|----------|-----------------|--------|
 | B01 |  7.28 px |  7.38 px | **+1.3 %** |
-| B02 | 22.10 px | 17.85 px | **−19.2 %** |
+| B02 | 22.10 px | 19.27 px | **−12.8 %** |
 | B05 | 16.09 px | 17.39 px | **+8.1 %** |
 | B07 | 11.94 px |  7.99 px | **−33.1 %** |
 
-(B02's figure was −12.8 % from the 2σ rule alone; removing the two dead frames
-as well took it to −19.2 %.)
+(B02's two dead frames are left in, as described in Step 3b. Force-rejecting
+them as well would take its figure from −12.8 % to −19.2 %.)
 
 **Rejection is not uniformly beneficial**, and this is worth stating plainly
 rather than presenting it as a straight win. B07 and B02 improve substantially;
@@ -488,8 +583,15 @@ order:
 
 1. a 4×4 grid — one row per subject: albedo and the three height maps `z_a`,
    `z_b`, `z_c`;
-2. four 8×8 outlier montages, one per subject, flagged pixels in red;
-3. a 4×3 before/after grid — baseline `z_c`, outlier-rejected `z_c`, and the
+2. four measured / rendered / difference figures, one per subject, each three
+   8×8 montages side by side;
+3. four 8×8 outlier montages, one per subject, flagged pixels in red;
+4. a 4×4 grid of the re-computed albedo — baseline, rejected, the difference,
+   and the per-pixel normal change in degrees;
+5. a 4×4 grid of the normal X and Y components, baseline vs rejected;
+6. a 4×3 before/after grid — baseline `z_c`, outlier-rejected `z_c`, and the
    difference;
-4. 3D renders via the supplied `plot_face_3d`, baseline then outlier-rejected
-   for each face.
+7. 3D renders via the supplied `plot_face_3d`, baseline then outlier-rejected
+   for each face (8 windows, one at a time).
+
+20 figures in total.
