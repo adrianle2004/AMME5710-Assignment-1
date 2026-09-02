@@ -27,7 +27,7 @@ def load_subject(tag):
 
 
 # ---------------------------------------------------------------------------
-# Step 0: images + lighting -> albedo and surface normals
+# Images + lighting -> compute albedo and surface normals
 # ---------------------------------------------------------------------------
 # Lambertian model for pixel (x,y) under light k:   I_k = rho * (n . l_k)
 # Substituting g = rho * n makes it linear:         I_k = l_k . g
@@ -45,7 +45,7 @@ def solve_photometric_stereo(imgs, light_dirs):
 
 
 # ---------------------------------------------------------------------------
-# Step 1: surface normals -> surface gradients
+# Surface normals -> surface gradients
 # ---------------------------------------------------------------------------
 # Model the face as a height function z = f(x,y) over the image plane.
 # Tangents:  (1, 0, dz/dx)  and  (0, 1, dz/dy)
@@ -57,7 +57,7 @@ def solve_photometric_stereo(imgs, light_dirs):
 # is just z -> -z, i.e. the supplied normals use a height axis pointing away
 # from the camera.
 #
-# Step 2: integrate the gradients into a height map
+# Integrate the gradients into a height map
 # ---------------------------------------------------------------------------
 # z(x,y) = z(0,0) + integral of (p dx + q dy) along a path from the top-left.
 # With dx = dy = 1 each integral is a cumulative sum. Sums start at index 1 so
@@ -124,7 +124,7 @@ plt.show()
 
 
 # ---------------------------------------------------------------------------
-# Step 3: outlier detection
+# Outlier detection
 # ---------------------------------------------------------------------------
 # Having albedo and a normal for a pixel, the Lambertian model can *predict*
 # how bright that pixel should have been in every one of the 64 images. The
@@ -237,7 +237,7 @@ for tag in tags:
 
 
 # ---------------------------------------------------------------------------
-# Step 4: re-solve for albedo and normals, ignoring the outliers
+# Re-solve for albedo and normals, ignoring the outliers
 # ---------------------------------------------------------------------------
 # Once every pixel keeps a different subset of the 64 images, the single shared
 # lstsq of Step 0 no longer applies - each pixel now has its own system. Rather
