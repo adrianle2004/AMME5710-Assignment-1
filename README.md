@@ -595,3 +595,377 @@ order:
    for each face (8 windows, one at a time).
 
 20 figures in total.
+
+---
+
+## Question 2 — Connect-Four Board State
+
+Determining the state of a connect-four board — a 6×7 matrix of `0` (empty),
+`1` (yellow) or `2` (red) — from a single photograph of it, taken from an
+arbitrary perspective. Run with `python3 mainQ2.py`.
+
+The dataset is 15 images of the same board at 3472×2598, in varying states of
+play and from varying viewpoints, with validation data in
+`assign1Q2_validationdata/`: `board_corners.pkl` (the four board corners per
+image, ordered upper-left, upper-right, lower-left, lower-right) and
+`board_states.pkl` (the ground-truth 6×7 matrix per image).
+
+The approach follows "Idea 1" from the assignment brief: isolate the board by
+its colour, find its four corners, rectify it with a perspective transform, then
+read off each of the 42 cells.
+
+---
+
+### Step 0 — Isolating the board by colour
+
+The board is a distinct saturated blue, so the natural first move is a colour
+threshold in HSV. HSV is preferred over BGR here because it separates *what
+colour* something is (hue) from *how vivid* (saturation) and *how bright*
+(value) it is — so shading across the board changes mainly `V` while leaving `H`
+almost untouched, which a BGR threshold cannot express.
+
+Rather than hard-coding threshold bounds, the bounds are *derived per image*
+from the histogram of that image. This adapts to the different lighting
+conditions across the dataset.
+
+#### The hue peak
+
+`cv2.calcHist` builds a histogram of the hue channel and the peak within the
+blue range is taken as the board's hue:
+
+```python
+hist_h = cv2.calcHist([hsv_frame], [0], None, [180], [0, 180])
+peak_hue = blue_hue_range[0] + int(np.argmax(hist_h[blue_hue_range[0]:blue_hue_range[1]]))
+```
+
+Two details matter here:
+
+- **OpenCV packs hue into 0–179**, not 0–255, so that a full 360° hue circle fits
+  in a `uint8` at 2° per step. The histogram is therefore built with 180 bins over
+  `[0, 180]`. Using 256 bins over `[0, 256]` leaves 76 bins permanently empty.
+- **`np.argmax` over a slice returns an index into the slice**, not into the
+  original array. `np.argmax(hist_h[100:140])` returns a number in 0–39, so the
+  slice start must be added back on to recover the true hue bin. Omitting this
+  silently yields a hue in the wrong part of the spectrum entirely.
+
+This step is reliable: across all 15 images the recovered peak hue lands in a
+range of just **100–102**.
+
+#### Why the saturation peak needs Otsu
+
+The obvious next step — take the peak of the saturation histogram the same way —
+does not work, and it is worth recording why, because the failure is silent.
+
+Measuring the board region (using the ground-truth corners) against everything
+else gives:
+
+| region | median H | median S | median V |
+| --- | --- | --- | --- |
+| board | 101 | **218** | 130 |
+| background | 20 | **61** | 168 |
+
+The wall behind the board is *the same hue* as the board — it is a pale
+blue-grey — but far less saturated. Critically, it also covers roughly **five
+times more of the image** than the board does. So a saturation histogram taken
+over all blue-hued pixels is dominated by the wall: on `001.jpg` the peak lands
+at `S = 39`, and the resulting ±50 window of `[0, 89]` selects the wall and
+excludes the board completely. The mask comes out inverted from what was
+intended, with the board appearing as a silhouette-shaped hole in it.
+
+Hue cannot separate these two populations. Saturation can — 218 versus 61 — but
+only if the peak is measured on the correct population. **Otsu's method** is used
+to find the split point:
+
+```python
+blue_saturations = hsv_frame[:, :, 1][hue_mask > 0].reshape(-1, 1)
+sat_split, _ = cv2.threshold(blue_saturations, 0, 255,
+                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+```
+
+Otsu assumes the data is bimodal and picks the threshold minimising the
+intra-class variance of the two resulting groups — exactly the situation here
+(a low-saturation wall mode and a high-saturation board mode). Everything below
+the split is discarded, and the saturation and value peaks are then measured on
+the surviving pixels only.
+
+The split point is chosen independently per image and lands in the narrow band
+**123–138** across the dataset, which is reassuring: it is adapting slightly to
+each image's lighting rather than jumping around.
+
+#### Final bounds
+
+```python
+lower_bound = np.array([hue_lo, peak_saturation - 60, peak_value - 100], np.uint8)
+upper_bound = np.array([hue_hi, peak_saturation + 60, peak_value + 100], np.uint8)
+mask = cv2.inRange(hsv_frame, lower_bound, upper_bound)
+```
+
+The value window (±100) is deliberately much wider than the hue (±10) and
+saturation (±60) windows, because brightness varies substantially across the
+board with shading and specular highlights while hue and saturation stay tight.
+A ±50 value window was measured to clip shadowed regions of the board and cost
+~5% of recall for no gain in precision.
+
+All bounds are clipped to their valid channel ranges before being cast to
+`uint8`. Without this, `peak_value - 100` can go negative and wrap around to a
+large positive number, inverting the test.
+
+#### Colour selection results
+
+Scored against the ground-truth board polygons:
+
+| metric | value |
+| --- | --- |
+| mean precision | **0.971** (worst image 0.915) |
+| mean recall | 0.648 |
+
+Recall is capped near 0.65 *by construction* and is not a defect: the
+ground-truth polygon spans the whole board rectangle, which includes the 42
+holes and the tokens sitting in them. Those are not blue and correctly are not
+selected. Precision is the meaningful number here, and at 97% almost nothing
+outside the board survives the threshold. The residual 3% is mostly the board's
+own side edge, which protrudes slightly beyond the four labelled corners — again
+a correct detection rather than an error.
+
+---
+
+### Step 1 — Binarisation and morphology
+
+The masked colour image is reduced to a binary mask and cleaned with an
+opening followed by a closing, repeated `n` times, with a 5×5 rectangular
+structuring element:
+
+```python
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+for _ in range(n):
+    bin_board = cv2.morphologyEx(bin_board, cv2.MORPH_OPEN, kernel)
+    bin_board = cv2.morphologyEx(bin_board, cv2.MORPH_CLOSE, kernel)
+```
+
+**Opening** (erode then dilate) removes small bright specks smaller than the
+kernel; **closing** (dilate then erode) fills small dark holes. Together they
+tidy the mask boundary without materially changing the board's shape.
+
+Sweeping the iteration count and measuring the effect on the final corner
+accuracy:
+
+| iterations | mean corner error | contours per image |
+| --- | --- | --- |
+| 0 (none) | **8.2 px** | 2 – 123 |
+| 1 | 9.1 px | 1 – 24 |
+| 3 | 9.1 px | 1 – 24 |
+| 5 | 9.1 px | 1 – 24 |
+| 10 | 9.1 px | 1 – 24 |
+
+The honest reading of this table is that **morphology is not improving corner
+accuracy on this dataset** — it costs about 0.9 px — and that everything beyond
+the first iteration does nothing at all, because the mask reaches a fixed point.
+What it does achieve is cutting the number of spurious contours by roughly 5×
+(from as many as 123 down to 24), which makes the contour stage cheaper and less
+dependent on the largest-area selection being right.
+
+The colour mask is simply already clean enough (97% precision) that there is
+little left for morphology to fix. It is retained because the cost is negligible
+and the reduction in spurious contours is a genuine robustness gain, but the
+measurement above is the reason, rather than an assumption that cleaning always
+helps.
+
+---
+
+### Step 2 — From contour to four corners
+
+This is the step that converts a blob into four usable coordinates. It has three
+parts, and each one exists for a specific reason.
+
+#### 2a — Select the board contour
+
+```python
+contours, _ = cv2.findContours(bin_board, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+board_contour = max(contours, key=cv2.contourArea)
+```
+
+`RETR_EXTERNAL` keeps only outermost contours, discarding the 42 hole boundaries
+nested inside the board — those are interior contours and are not wanted when
+looking for the outline. `CHAIN_APPROX_SIMPLE` collapses straight runs of pixels
+into their endpoints, which reduces memory without losing shape.
+
+Even after morphology, an image can contain up to 24 contours. On `001.jpg`
+there are 2, with areas of **1,423,978** and **25,623** pixels — the board and a
+leftover speck. Selecting by maximum area is what guarantees the board is the
+one carried forward. Drawing or processing *all* contours instead is a common
+mistake here and will corrupt the corner estimate.
+
+The selected contour is an **outline**, not a set of corners: on `001.jpg` it
+consists of **1349 points**, roughly one every few pixels around the perimeter.
+Across the dataset the largest contour ranges from 662 to 2051 points. The task
+of the next step is to reduce that to exactly 4.
+
+#### 2b — Simplify the outline to a quadrilateral
+
+`cv2.approxPolyDP` implements the **Douglas–Peucker** algorithm. It recursively
+discards any vertex lying within `epsilon` pixels of the straight line joining
+its neighbours — a point in the middle of a straight edge carries no shape
+information, whereas a point where the outline turns does. What survives are the
+corners.
+
+`epsilon` is expressed as a fraction of the contour perimeter so that it scales
+with the apparent size of the board rather than being fixed in pixels:
+
+```python
+epsilon = epsilon_fraction * cv2.arcLength(board_contour, True)
+candidate = cv2.approxPolyDP(board_contour, epsilon, True)
+```
+
+The choice of fraction matters. On `001.jpg`:
+
+| epsilon fraction | resulting vertices |
+| --- | --- |
+| 0.001 | 10 |
+| 0.005 | 4 |
+| 0.010 | 4 |
+| 0.020 | 4 |
+
+Too small a value retains bumps along the edges and yields more than four
+vertices; too large begins to cut corners off the shape. Rather than trusting a
+single hard-coded fraction to be correct on every image, the implementation
+**sweeps the fraction from 0.01 upward in steps of 0.005 and stops at the first
+value that produces exactly four vertices**. If no value in the range succeeds,
+it falls back to `cv2.minAreaRect` / `cv2.boxPoints`, which returns the minimum
+enclosing rotated rectangle and therefore always has exactly four corners. On
+this dataset the sweep succeeds on all 15 images and the fallback is never
+reached, but it prevents a hard failure on an unseen image.
+
+#### 2c — Sort the corners into a known order
+
+`approxPolyDP` returns the four points **in the order the contour was traced**,
+which depends on the board's orientation and on where in the outline the trace
+happened to begin. It is *not* a fixed geometric order. On `001.jpg` the raw
+output is:
+
+```
+[0] x= 437  y=1079     <- upper left
+[1] x= 652  y=2003     <- lower LEFT
+[2] x=1958  y=2164     <- lower right
+[3] x=2136  y=1186     <- upper RIGHT
+```
+
+Index `1` is the lower-left corner, not the upper-right. On a differently
+oriented photograph the assignment of indices changes, so the points cannot be
+used positionally and must be identified geometrically.
+
+The standard trick uses the sums and differences of the coordinates. Recall that
+in image coordinates **x increases to the right and y increases downward**:
+
+- the **upper-left** corner is nearest the origin, so it has the **smallest**
+  `x + y`;
+- the **lower-right** corner is furthest from it, so it has the **largest**
+  `x + y`;
+- the **upper-right** corner has large `x` and small `y`, so `y − x` is at its
+  **most negative**;
+- the **lower-left** corner has small `x` and large `y`, so `y − x` is at its
+  **most positive**.
+
+Evaluated on the points above:
+
+| index | `x + y` | `y − x` | identified as |
+| --- | --- | --- | --- |
+| 0 | **1516** (min) | 642 | upper left |
+| 1 | 2655 | **1351** (max) | lower left |
+| 2 | **4122** (max) | 206 | lower right |
+| 3 | 3322 | **−950** (min) | upper right |
+
+which recovers the correct labelling. This works for any convex quadrilateral
+under moderate perspective, and is orientation-independent.
+
+The function returns the corners ordered **(upper-left, upper-right, lower-left,
+lower-right)** to match the convention used in `board_corners.pkl`, so detected
+corners can be compared against ground truth directly without reordering.
+
+> **Note.** That ordering is *not* a valid polygon winding — tracing
+> UL → UR → LL → LR crosses over itself in a bow-tie. Anywhere the corners are
+> used as a polygon (drawing the outline, or feeding
+> `cv2.getPerspectiveTransform`) they must be reordered to UL → UR → LR → LL,
+> which is what the `corners[[0, 1, 3, 2]]` indexing in the display code does.
+> Getting this wrong produces a mirrored or rotated rectification and a
+> transposed board matrix.
+
+#### Corner detection results
+
+Mean Euclidean distance from each detected corner to its ground-truth
+counterpart, in pixels, on 3472×2598 images:
+
+| image | UL | UR | LL | LR | mean |
+| --- | --- | --- | --- | --- | --- |
+| 001 | 35.5 | 30.1 | 2.2 | 6.3 | 18.5 |
+| 002 | 43.8 | 23.3 | 3.6 | 9.8 | 20.2 |
+| 003 | 8.1 | 2.2 | 2.0 | 10.0 | 5.6 |
+| 004 | 34.7 | 17.1 | 1.4 | 5.7 | 14.7 |
+| 005 | 2.2 | 4.1 | 1.0 | 5.8 | 3.3 |
+| 006 | 11.4 | 1.0 | 2.0 | 8.6 | 5.8 |
+| 007 | 23.7 | 3.2 | 3.2 | 16.3 | 11.6 |
+| 008 | 11.4 | 2.2 | 1.4 | 7.2 | 5.6 |
+| 009 | 6.4 | 1.4 | 1.4 | 6.4 | 3.9 |
+| 010 | 8.6 | 1.4 | 1.0 | 9.9 | 5.2 |
+| 011 | 5.8 | 29.5 | 1.0 | 13.0 | 12.4 |
+| 012 | 2.0 | 3.6 | 0.0 | 11.3 | 4.2 |
+| 013 | 7.2 | 2.2 | 1.4 | 9.2 | 5.0 |
+| 014 | 35.4 | 2.2 | 2.2 | 13.0 | 13.2 |
+| 015 | 14.1 | 5.0 | 1.4 | 7.2 | 6.9 |
+
+**Mean 9.1 px, worst image 20.2 px** — approximately 0.3% of the board's width,
+and a small fraction of a cell, so the error is well within tolerance for
+locating cells.
+
+The error is **systematically worse at the top of the board**: the two upper
+corners average 12.6 px against 5.5 px for the two lower ones, and every large
+outlier in the table is a UL or UR entry. This is not random noise. The physical
+board has a raised lip around the token entry slot along its top edge, so the
+detected contour follows the true silhouette of the plastic while the
+hand-labelled corners sit at the playing-field boundary slightly below it. The
+two are measuring genuinely different things, and the detection is not wrong so
+much as differently defined. The bottom corners, where no such lip exists, agree
+to within a few pixels.
+
+---
+
+### Status
+
+Implemented in `mainQ2.py`:
+
+- `histogram_color_select` — per-image adaptive HSV threshold isolating the board
+- `morphological_operations` — opening/closing cleanup of the binary mask
+- `find_board_corners` — contour → quadrilateral → ordered corners
+- `show` — display helper that scales the 3472×2598 images down to fit on screen
+
+Still to do:
+
+1. `cv2.getPerspectiveTransform` and `cv2.warpPerspective` to rectify the board
+   to a fronto-parallel view using the detected corners;
+2. sampling each of the 42 cells in the rectified image and classifying it as
+   empty / yellow / red by colour;
+3. the accuracy reporting the brief requires — per-image board accuracy, average
+   board accuracy across all images, and overall accuracy (the percentage of
+   images with all 42 cells correct).
+
+An exploratory prototype of stages 1 and 2 — warping to 700×600, sampling a disc
+at each cell centre and classifying by hue with a saturation gate — reached
+**99.5% cell accuracy with 14 of 15 boards perfect** using the detected corners.
+That figure is indicative only and is not yet part of `mainQ2.py`.
+
+---
+
+### Running
+
+```bash
+python3 mainQ2.py
+```
+
+Requires `numpy`, `opencv-python` and `matplotlib` only.
+
+> **Environment note.** `cv2.Mat` exists only in the `opencv-python` wheels from
+> version 4.7 onward. Ubuntu's apt-packaged `python3-opencv` (4.6.0) does not
+> provide it, and using it as a type annotation raises `AttributeError: module
+> 'cv2' has no attribute 'Mat'` at import time, because annotations are evaluated
+> when the `def` statement runs. All annotations here use `np.ndarray` instead,
+> which is portable across versions and matches the brief's requirement that the
+> function take "a numpy array containing the colour image data".
