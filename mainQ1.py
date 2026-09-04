@@ -241,28 +241,42 @@ def montage(imgs, n_cols=8, pad=2, pad_value=1.0):
 # images, each with its own title, colour map and optional colour limits. One
 # helper draws all of them. `rows` is a list (one entry per subject) of lists of
 # (image, title, cmap, clim) panels.
-def plot_grid(rows, width=13):
+def plot_grid(rows, width=14, suptitle=None):
     n_r, n_c = len(rows), len(rows[0])
-    fig, axes = plt.subplots(n_r, n_c, figsize=(width, 3.2 * n_r))
+    fig, axes = plt.subplots(n_r, n_c, figsize=(width, 3.4 * n_r))
     for ax_row, panels in zip(np.atleast_2d(axes), rows):
-        for ax, (img, title, cmap, clim) in zip(ax_row, panels):
+        for ax, (img, title, cmap, clim, unit) in zip(ax_row, panels):
             lo, hi = clim if clim else (None, None)
             im = ax.imshow(img, cmap=cmap, vmin=lo, vmax=hi)
             ax.set_title(title, fontsize=9)
             ax.axis('off')
-            fig.colorbar(im, ax=ax, fraction=0.046)
-    plt.tight_layout()
+            # Every panel is an image of a different physical quantity, so the
+            # colour bar carries the name and units of what it is measuring
+            cb = fig.colorbar(im, ax=ax, fraction=0.046)
+            cb.set_label(unit, fontsize=7)
+            cb.ax.tick_params(labelsize=7)
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=13)
+    # Leave a strip at the top for the figure title and at the right so the
+    # last colour bar's label is not clipped off the edge of the window
+    plt.tight_layout(rect=(0.0, 0.0, 0.98, 0.97))
     plt.show()
 
 
 # Figure 1: every subject on its own row, showing the albedo alongside the
 # three integration strategies so the artefacts of each can be compared.
 def plot_albedo_and_heights(results, tags):
-    plot_grid([[(results[t]['albedo'], '%s albedo' % t, 'gray', None),
-                (results[t]['z_a'], '%s (a) row first' % t, 'viridis', None),
-                (results[t]['z_b'], '%s (b) column first' % t, 'viridis', None),
-                (results[t]['z_c'], '%s (c) average' % t, 'viridis', None)]
-               for t in tags], width=12)
+    plot_grid([[(results[t]['albedo'], '%s albedo' % t, 'gray', None,
+                 'albedo (0-1)'),
+                (results[t]['z_a'], '%s (a) top row, then down columns' % t,
+                 'viridis', None, 'height z (px)'),
+                (results[t]['z_b'], '%s (b) first column, then across rows' % t,
+                 'viridis', None, 'height z (px)'),
+                (results[t]['z_c'], '%s (c) average of (a) and (b)' % t,
+                 'viridis', None, 'height z (px)')]
+               for t in tags], width=14,
+              suptitle='Figure 1  -  Recovered albedo and the three '
+                       'integration strategies, one row per subject')
 
 
 # Figure 2: measured, rendered and their difference, side by side, one figure
@@ -291,9 +305,15 @@ def plot_render_comparison(tag, imgs, rendered, diff):
     im = axes[2].imshow(montage(diff, pad_value=0.0), cmap='coolwarm',
                         vmin=-lim, vmax=lim)
     axes[2].set_title('%s difference (measured - rendered)' % tag, fontsize=11)
-    fig.colorbar(im, cax=axes[3])
+    cb = fig.colorbar(im, cax=axes[3])
+    cb.set_label('residual, intensity units (0-1 scale)', fontsize=8)
+    cb.ax.tick_params(labelsize=8)
     for ax in axes[:3]:
         ax.axis('off')
+    fig.suptitle('Figure 2 (%s)  -  all 64 lighting conditions: measured '
+                 'images, the Lambertian model rendered from the recovered '
+                 'albedo and normals, and the residual between them'
+                 % tag, fontsize=12)
     plt.tight_layout()
     plt.show()
 
@@ -353,36 +373,80 @@ def plot_albedo_normal_change(results, tags):
         d = results[t]['albedo2'] - results[t]['albedo']
         lim = np.percentile(np.abs(d), 99.5)
         rows.append([
-            (results[t]['albedo'], '%s albedo baseline' % t, 'gray', None),
-            (results[t]['albedo2'], '%s albedo rejected' % t, 'gray', None),
-            (d, '%s albedo change' % t, 'coolwarm', (-lim, lim)),
-            (results[t]['normal_change'], '%s normal change (deg)' % t,
-             'magma', None)])
-    plot_grid(rows)
+            (results[t]['albedo'], '%s albedo, all 64 views' % t, 'gray',
+             None, 'albedo (0-1)'),
+            (results[t]['albedo2'], '%s albedo, outliers rejected' % t,
+             'gray', None, 'albedo (0-1)'),
+            (d, '%s albedo change (red = raised)' % t, 'coolwarm',
+             (-lim, lim), 'change in albedo'),
+            (results[t]['normal_change'],
+             '%s angle between old and new normal' % t, 'magma', None,
+             'angle (degrees)')])
+    plot_grid(rows,
+              suptitle='Figure 4  -  Effect of outlier rejection on the '
+                       'recovered albedo and surface normals')
 
 
 # Figure 5: the surface normal X and Y components before and after rejection,
 # displayed as in the week 2 tutorial. These are the fields that Step 2 turns
 # into the gradients p and q, so any change here is what moves the surface.
 def plot_normal_components(results, tags):
-    plot_grid([[(results[t][k][:, :, c], '%s normal %s %s' % (t, xy, lbl),
-                 'viridis', (-1.0, 1.0))
+    plot_grid([[(results[t][k][:, :, c],
+                 '%s normal %s, %s' % (t, xy, lbl), 'viridis', (-1.0, 1.0),
+                 'n_%s (unit vector)' % xy.lower())
                 for c, xy in [(0, 'X'), (1, 'Y')]
-                for k, lbl in [('normals', 'baseline'),
-                               ('normals2', 'rejected')]]
-               for t in tags])
+                for k, lbl in [('normals', 'all 64 views'),
+                               ('normals2', 'outliers rejected')]]
+               for t in tags],
+              suptitle='Figure 5  -  Surface normal X and Y components, which '
+                       'Step 2 turns into the gradients p and q')
 
 
-# Figure 6: before / after comparison of the averaged height maps, with the
-# difference between them in the third column to show where rejecting the
-# outliers actually changed the reconstruction.
+# plot_face_3d is the supplied helper and it calls plt.show() itself, so there
+# is no chance to add a title afterwards - the window has already been drawn.
+# Substituting plt.show for the duration of the call gives one opportunity to
+# label the figure before it appears. Without this the eight 3D windows are
+# indistinguishable from one another.
+def plot_face_3d_titled(height_map, albedo, title):
+    real_show = plt.show
+
+    def show_with_title(*args, **kwargs):
+        plt.gcf().suptitle(title, fontsize=11)
+        real_show(*args, **kwargs)
+
+    plt.show = show_with_title
+    try:
+        plot_face_3d(height_map, albedo)
+    finally:
+        plt.show = real_show
+
+
+# Figure 6: before / after comparison of the averaged height maps.
+#
+#   baseline / rejected   the two surfaces, on their own colour scales
+#   difference            z_c2 - z_c, on a symmetric red/blue scale so that
+#                         zero is the neutral colour and the sign is readable.
+#                         Red = rejection raised the surface, blue = lowered it
 def plot_before_after(results, tags):
-    plot_grid([[(results[t]['z_c'], '%s baseline (c)' % t, 'viridis', None),
-                (results[t]['z_c2'], '%s outliers rejected (c)' % t,
-                 'viridis', None),
-                (results[t]['z_c2'] - results[t]['z_c'], '%s difference' % t,
-                 'coolwarm', None)]
-               for t in tags], width=11)
+    panels = []
+    for t in tags:
+        d = results[t]['z_c2'] - results[t]['z_c']
+        lim = np.percentile(np.abs(d), 99.5)
+        panels.append([
+            (results[t]['z_c'], '%s height (c), all 64 views' % t, 'viridis',
+             None, 'height z (px)'),
+            (results[t]['z_c2'], '%s height (c), outliers rejected' % t,
+             'viridis', None, 'height z (px)'),
+            (d, '%s difference (rejected - baseline)' % t, 'coolwarm',
+             (-lim, lim), 'change in z (px)')])
+
+    # Two subjects per row rather than one, so the four faces form a 2x2 block
+    # of before / after / difference triplets: B01 and B02 on the top row,
+    # B05 and B07 below
+    rows = [panels[i] + panels[i + 1] for i in range(0, len(panels) - 1, 2)]
+    plot_grid(rows, width=20,
+              suptitle='Figure 6  -  Effect of outlier rejection on the '
+                       'integrated height map')
 
 
 # ===========================================================================
@@ -447,8 +511,13 @@ for tag in tags:
 for tag in tags:
     res = results[tag]
     overlay_montage(res['imgs'], res['outliers'],
-                    '%s - red = |residual| > 2 sigma  (panel number and '
-                    'percentage of pixels flagged)' % tag)
+                    'Figure 3 (%s)  -  outlier map for all 64 lighting '
+                    'conditions.  Red = observation rejected, '
+                    '|residual| > 2 x (per-pixel standard deviation of that '
+                    "pixel's 64 residuals).\nEach panel is labelled with its "
+                    'frame index and the percentage of its pixels flagged; '
+                    'panels are contrast-stretched for visibility only.'
+                    % tag)
 
 
 # --- Step 5: re-solve without the flagged data, then re-integrate ----------
@@ -481,6 +550,15 @@ for tag in tags:
              100.0 * np.abs(d_alb).mean() / res['albedo'].mean(),
              rms0, rms1, 100.0 * (rms1 - rms0) / rms0))
 
+    # How much the height map itself moved. Reported as a fraction of the
+    # height range so it can be compared across subjects of different depth.
+    d_z = z_c2 - res['z_c']
+    rng = res['z_c'].max() - res['z_c'].min()
+    print('     height range %.1f px; changed by %.2f px RMS (%.1f%% of '
+          'range), %.2f px max'
+          % (rng, np.sqrt(np.mean(d_z ** 2)),
+             100.0 * np.sqrt(np.mean(d_z ** 2)) / rng, np.abs(d_z).max()))
+
 # The re-computed albedo and normals themselves, then their effect on height
 plot_albedo_normal_change(results, tags)
 plot_normal_components(results, tags)
@@ -492,5 +570,9 @@ plot_before_after(results, tags)
 # one built from the outlier-rejected albedo and normals, so the two can be
 # compared directly. plot_face_3d opens one window at a time.
 for tag in tags:
-    plot_face_3d(results[tag]['z_c'], results[tag]['albedo'])
-    plot_face_3d(results[tag]['z_c2'], results[tag]['albedo2'])
+    plot_face_3d_titled(results[tag]['z_c'], results[tag]['albedo'],
+                        'Figure 7 (%s)  -  3D reconstruction, strategy (c), '
+                        'all 64 views' % tag)
+    plot_face_3d_titled(results[tag]['z_c2'], results[tag]['albedo2'],
+                        'Figure 7 (%s)  -  3D reconstruction, strategy (c), '
+                        'outliers rejected' % tag)

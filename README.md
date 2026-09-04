@@ -489,6 +489,24 @@ Three figures cover this: albedo before / after / difference plus the normal
 change map, then the normal X and Y components before and after (displayed as
 in the week 2 tutorial), then the height maps.
 
+#### Why the 3D renders look unchanged
+
+The height maps do move. `z_c` changes by 5-10 px RMS, which is 6-9% of the
+height range, with peaks of 14-17 px. But the 3D renders of Step 6 look almost
+identical before and after.
+
+The reason is that rejection moves every normal by a small amount (4.1-4.3 deg
+on average) in a broadly similar direction, and a near-uniform rotation of the
+normal field integrates into a slow ramp in z rather than a change in relief.
+The surface shifts and leans; it does not deform much. A 3D viewer with
+auto-scaled axes draws a shifted, slightly leaning surface much the same way,
+so the change is largely invisible there. The difference map of Figure 6 shows
+it directly instead, which is why it is included.
+
+The consistency scores agree that the change is real but not uniformly an
+improvement: `RMS |z_a - z_b|` falls 33.1% on B07 and 12.8% on B02, but rises
+1.3% on B01 and 8.1% on B05.
+
 ---
 
 ### Results
@@ -578,23 +596,27 @@ the implementation follows the specified cumulative-sum strategies.
 python3 mainQ1.py
 ```
 
-Requires `numpy`, `opencv-python` and `matplotlib` only. Plots produced, in
+Requires `numpy`, `opencv-python` and `matplotlib` only. Every figure carries a
+title naming what it shows, every panel is titled with its subject and
+quantity, and every colour bar is labelled with its units. Plots produced, in
 order:
 
-1. a 4×4 grid — one row per subject: albedo and the three height maps `z_a`,
-   `z_b`, `z_c`;
-2. four measured / rendered / difference figures, one per subject, each three
-   8×8 montages side by side;
-3. four 8×8 outlier montages, one per subject, flagged pixels in red;
-4. a 4×4 grid of the re-computed albedo — baseline, rejected, the difference,
-   and the per-pixel normal change in degrees;
-5. a 4×4 grid of the normal X and Y components, baseline vs rejected;
-6. a 4×3 before/after grid — baseline `z_c`, outlier-rejected `z_c`, and the
-   difference;
-7. 3D renders via the supplied `plot_face_3d`, baseline then outlier-rejected
-   for each face (8 windows, one at a time).
+| # | Figure | Windows |
+|---|--------|---------|
+| 1 | Recovered albedo and the three integration strategies, one row per subject | 1 |
+| 2 | All 64 lighting conditions: measured, rendered, residual — one per subject | 4 |
+| 3 | Outlier map, flagged observations in red over all 64 frames | 4 |
+| 4 | Effect of rejection on albedo and surface normals | 1 |
+| 5 | Surface normal X and Y components, baseline vs rejected | 1 |
+| 6 | Effect of rejection on the integrated height map, before / after / difference | 1 |
+| 7 | 3D reconstructions via the supplied `plot_face_3d`, baseline then rejected | 8 |
 
 20 figures in total.
+
+`plot_face_3d` calls `plt.show()` itself, so there is no chance to title the
+window after the fact. `plot_face_3d_titled` substitutes `plt.show` for the
+duration of the call to add a title first, restoring it in a `finally` block.
+Without this the eight 3D windows are indistinguishable from one another.
 
 ---
 
