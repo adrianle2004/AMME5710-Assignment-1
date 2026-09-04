@@ -307,88 +307,328 @@ def find_cells_by_mask(warped_board: np.ndarray) -> tuple:
     return output_img, np.array(centres)
 
 
-img = cv2.imread('connect_four_images_A1/013.jpg')
 
-# Step 0 - isolate the board by its colour
-board = histogram_color_select(img)
+def assign_cells_to_grid(centres: np.ndarray, board_shape: tuple) -> np.ndarray:
+    """
+    Assigns detected cell centres to their (row, column) position in the 6-by-7
+    playing grid.
 
-# Step 1 - reduce to a binary mask and clean it up with morphology
-bin_board = cv2.cvtColor(board, cv2.COLOR_BGR2GRAY)
-bin_board = cv2.threshold(bin_board, 1, 255, cv2.THRESH_BINARY)[1]
-bin_board = morphological_operations(bin_board, 5)
+    Once the board has been rectified it is a plain axis-aligned rectangle that
+    is exactly 7 cells wide and 6 cells tall, so a centre's position in the grid
+    follows directly from where it falls in the image: dividing its x coordinate
+    by the cell width gives the column and its y coordinate by the cell height
+    gives the row. No sorting or clustering of the detections is needed, and a
+    missing detection simply leaves its slot empty instead of shifting every
+    later cell along by one, which is what a sort-based assignment would do.
 
-# Step 2 - trace the board outline and reduce it to four corners
-contours, _ = cv2.findContours(bin_board, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-board_contour = max(contours, key=cv2.contourArea)
-corners = find_board_corners(bin_board)
+    Args:
+        centres (np.ndarray): An N-by-2 array of (x, y) cell centre coordinates
+            in the rectified board image.
+        board_shape (tuple): The shape of the rectified board image, i.e.
+            (height, width) or (height, width, channels).
 
-print('detected corners (UL, UR, LL, LR):')
-print(corners)
+    Returns:
+        np.ndarray: A 6-by-7 int array holding, for each grid position, the
+            index into "centres" of the cell that was found there, or -1 if no
+            cell was detected at that position. Row 0 is the top of the board
+            and column 0 is the left, matching "board_states.pkl".
+    """
+    height, width = board_shape[:2]
+    cell_width = width / 7
+    cell_height = height / 6
 
+    grid = np.full((6, 7), -1, np.int32)
+    for index, (x, y) in enumerate(centres):
+        # Clipping guards against a centre sitting a pixel outside the board,
+        # which would otherwise index off the end of the grid.
+        column = int(np.clip(x // cell_width, 0, 6))
+        row = int(np.clip(y // cell_height, 0, 5))
+        grid[row, column] = index
 
-# ---------------------------------------------------------------------------
-# Figure 1 - the colour selection step
-# ---------------------------------------------------------------------------
-figure, axes = plt.subplots(1, 2, figsize=(9, 7), layout='constrained')
-show(axes[0], img, 'Original')
-show(axes[1], board, 'Board detection (colour selected)')
-figure.suptitle('Step 0 - isolating the board by colour')
-
-
-# ---------------------------------------------------------------------------
-# Figure 2 - the binary mask, the traced contour, and the recovered corners
-# ---------------------------------------------------------------------------
-
-# Draw the traced outline on its own copy of the original
-contour_overlay = img.copy()
-cv2.drawContours(contour_overlay, [board_contour], -1, (0, 255, 0), 12)
-
-# Draw the four corners on another copy. The corners are reordered to
-# UL, UR, LR, LL so that polylines traces the outline of the board rather
-# than crossing over itself in a bow-tie.
-corner_overlay = img.copy()
-cv2.polylines(corner_overlay, [corners[[0, 1, 3, 2]].astype(np.int32)], True, (0, 255, 0), 8)
-for x, y in corners:
-    cv2.circle(corner_overlay, (int(x), int(y)), 35, (0, 0, 255), -1)
-
-figure, axes = plt.subplots(1, 3, figsize=(13, 6), layout='constrained')
-show(axes[0], bin_board, 'Binary mask (after morphology)', gray=True)
-show(axes[1], contour_overlay, 'Largest contour (%d points)' % len(board_contour))
-show(axes[2], corner_overlay, 'Original with found corners')
-
-# Label each corner on the third panel so the ordering can be checked by eye
-for label, (x, y) in zip(['UL', 'UR', 'LL', 'LR'], corners):
-    axes[2].annotate(label, (x, y), color='yellow', fontsize=12, weight='bold',
-                     xytext=(12, 12), textcoords='offset points')
-
-figure.suptitle('Steps 1 and 2 - binary mask, contour and corner detection')
+    return grid
 
 
-warped_board, max_width, max_height = rectified_board(img, corners)
-print('warped board size: %d x %d px' % (max_width, max_height))
+def classify_cell_colour(hsv_board: np.ndarray, centre: np.ndarray,
+                         sample_radius: int) -> int:
+    """
+    Decides whether a single cell is empty, yellow or red.
 
-# ---------------------------------------------------------------------------
-# Figure 3 - the original next to the rectified board
-# ---------------------------------------------------------------------------
-figure, axes = plt.subplots(1, 2, figsize=(12, 6), layout='constrained')
-show(axes[0], img, 'Original (%d x %d)' % (img.shape[1], img.shape[0]))
-show(axes[1], warped_board, 'Perspective corrected (%d x %d)' % (max_width, max_height))
-figure.suptitle('Step 3 - rectifying the board with a perspective transform')
+    A disc of pixels is taken from the middle of the cell and reduced to a
+    single representative colour with the median, which ignores the specular
+    highlight on the token and the shadow around the rim of the opening in a way
+    that the mean would not. The decision is then made in HSV: saturation says
+    whether a token is present at all, because both token colours are strongly
+    saturated while the background seen through an empty opening is washed out,
+    and hue says which token it is. Hue is measured as a distance around the
+    colour circle rather than a plain range, because red straddles the 0/180
+    wrap-around point in OpenCV's packing and so appears at both ends.
 
-plt.show()
+    The thresholds below were set from the measured spread over all 630 cells of
+    the validation set:
 
-# ---------------------------------------------------------------------------
-# Figure 4 - locating the 42 cells, two ways
-# ---------------------------------------------------------------------------
-hough_img, hough_circles = circle_encoder(warped_board)
-mask_img, mask_centres = find_cells_by_mask(warped_board)
+        empty   hue 12-99, hue distance to red 12-89, saturation   8-177
+        yellow  hue 25-31, hue distance to red 25-31, saturation 206-238
+        red     hue  0- 2 or 178-179, distance 0-2,   saturation 172-238
 
-n_hough = 0 if hough_circles is None else len(hough_circles)
-print('cells found - Hough: %d/42, mask inversion: %d/42' % (n_hough, len(mask_centres)))
+    Both gates are needed. Saturation alone cannot separate empty from red,
+    because the wooden table seen through an opening reaches saturation 177
+    while the darkest red token sits at 172, but their hues are 12 apart at the
+    closest. Hue alone cannot separate empty from yellow, because 38 of the 358
+    empty cells have a hue inside the yellow band, but every one of them is
+    washed out to below saturation 150 while no yellow token falls below 206.
+    Using both leaves a wide margin on either decision.
 
-figure, axes = plt.subplots(1, 2, figsize=(13, 6), layout='constrained')
-show(axes[0], hough_img, 'HoughCircles (%d / 42 found)' % n_hough)
-show(axes[1], mask_img, 'Mask inversion (%d / 42 found)' % len(mask_centres))
-figure.suptitle('Step 4 - locating the 42 cells')
+    Args:
+        hsv_board (np.ndarray): The rectified board image converted to HSV.
+        centre (np.ndarray): The (x, y) centre of the cell to classify.
+        sample_radius (int): Radius in pixels of the disc to sample.
 
-plt.show()
+    Returns:
+        int: 0 if the cell is empty, 1 if it holds a yellow token, 2 if red.
+    """
+    # Sample a disc from the middle of the cell and take the median colour
+    sample_mask = np.zeros(hsv_board.shape[:2], np.uint8)
+    cv2.circle(sample_mask, (int(centre[0]), int(centre[1])), sample_radius, 255, -1)
+    hue, saturation, _ = np.median(hsv_board[sample_mask > 0], axis=0)
+
+    # A washed out cell has nothing in it
+    if saturation < 150:
+        return 0
+
+    # Red wraps around the end of the hue axis, so measure how far the hue is
+    # from 0 going either way around the circle
+    hue_distance_to_red = min(hue, 180 - hue)
+    if hue_distance_to_red <= 6:
+        return 2
+    if 20 <= hue <= 40:
+        return 1
+
+    # Saturated but neither token colour, so treat it as empty
+    return 0
+
+
+def encode_board_state(warped_board: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """
+    Builds the 6-by-7 board state from the detected cell centres.
+
+    Args:
+        warped_board (np.ndarray): The rectified BGR board image.
+        centres (np.ndarray): An N-by-2 array of detected cell centres.
+
+    Returns:
+        np.ndarray: A 6-by-7 int array of cell states, 0 empty, 1 yellow, 2 red.
+    """
+    grid = assign_cells_to_grid(centres, warped_board.shape)
+    hsv_board = cv2.cvtColor(warped_board, cv2.COLOR_BGR2HSV)
+
+    # Sample well inside the opening so the rim of the board is never included
+    cell_pitch = min(warped_board.shape[1] / 7, warped_board.shape[0] / 6)
+    sample_radius = int(0.20 * cell_pitch)
+
+    board_state = np.zeros((6, 7), np.int32)
+    for row in range(6):
+        for column in range(7):
+            index = grid[row, column]
+            # A grid position with no detection is left as empty, which is the
+            # correct guess: a cell holding a token is a solid disc of strong
+            # colour and is the easiest kind of cell to detect.
+            if index >= 0:
+                board_state[row, column] = classify_cell_colour(
+                    hsv_board, centres[index], sample_radius)
+
+    return board_state
+
+
+def board_state_from_image(img: np.ndarray) -> np.ndarray:
+    """
+    Determines the state of the connect four board in a photograph.
+
+    This runs the whole pipeline: isolate the board by colour, clean the mask up
+    with morphology, trace its outline and reduce it to four corners, rectify it
+    to a fronto-parallel view, find the 42 openings as holes in the board
+    colour, place them on the grid and read off each one's colour.
+
+    Args:
+        img (np.ndarray): A colour (BGR) photograph containing the board.
+
+    Returns:
+        np.ndarray: A 6-by-7 int array of cell states, 0 empty, 1 yellow, 2 red,
+            with row 0 the top of the board and column 0 the left.
+    """
+    # Step 0 - isolate the board by its colour
+    board = histogram_color_select(img)
+
+    # Step 1 - reduce to a binary mask and clean it up with morphology
+    bin_board = cv2.cvtColor(board, cv2.COLOR_BGR2GRAY)
+    bin_board = cv2.threshold(bin_board, 1, 255, cv2.THRESH_BINARY)[1]
+    bin_board = morphological_operations(bin_board, 5)
+
+    # Step 2 and 3 - find the corners and rectify
+    corners = find_board_corners(bin_board)
+    warped_board, _, _ = rectified_board(img, corners)
+
+    # Step 4 and 5 - find the cells and read their colours
+    _, centres = find_cells_by_mask(warped_board)
+
+    return encode_board_state(warped_board, centres)
+
+
+if __name__ == '__main__':
+    # -----------------------------------------------------------------------
+    # Accuracy over the validation set
+    # -----------------------------------------------------------------------
+    image_names = sorted(board_groundtruth)
+    board_accuracies = []
+    perfect_boards = 0
+
+    print('%-10s %-16s' % ('image', 'board accuracy'))
+    for name in image_names:
+        img = cv2.imread(os.path.join('connect_four_images_A1', name))
+        estimated_state = board_state_from_image(img)
+        true_state = np.array(board_groundtruth[name])
+
+        # Board Accuracy is the percentage of the 42 cells that are correct
+        correct_cells = int((estimated_state == true_state).sum())
+        board_accuracy = 100.0 * correct_cells / true_state.size
+        board_accuracies.append(board_accuracy)
+        if correct_cells == true_state.size:
+            perfect_boards += 1
+
+        print('%-10s %6.2f %%   (%d/%d cells)'
+              % (name, board_accuracy, correct_cells, true_state.size))
+
+    # Average Board Accuracy is the mean of the per image accuracies, and
+    # Overall Accuracy is the percentage of images recovered without a single
+    # cell wrong.
+    print()
+    print('Average Board Accuracy: %.2f %%' % np.mean(board_accuracies))
+    print('Overall Accuracy:       %.2f %% (%d/%d boards fully correct)'
+          % (100.0 * perfect_boards / len(image_names), perfect_boards, len(image_names)))
+
+    # -----------------------------------------------------------------------
+    # Walk one image through the pipeline for the figures
+    # -----------------------------------------------------------------------
+    demo_name = '013.jpg'
+    img = cv2.imread(os.path.join('connect_four_images_A1', demo_name))
+
+    # Step 0 - isolate the board by its colour
+    board = histogram_color_select(img)
+
+    # Step 1 - reduce to a binary mask and clean it up with morphology
+    bin_board = cv2.cvtColor(board, cv2.COLOR_BGR2GRAY)
+    bin_board = cv2.threshold(bin_board, 1, 255, cv2.THRESH_BINARY)[1]
+    bin_board = morphological_operations(bin_board, 5)
+
+    # Step 2 - trace the board outline and reduce it to four corners
+    contours, _ = cv2.findContours(bin_board, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    board_contour = max(contours, key=cv2.contourArea)
+    corners = find_board_corners(bin_board)
+
+    # -----------------------------------------------------------------------
+    # Figure 1 - the colour selection step
+    # -----------------------------------------------------------------------
+    figure, axes = plt.subplots(1, 2, figsize=(9, 7), layout='constrained')
+    show(axes[0], img, 'Original')
+    show(axes[1], board, 'Board detection (colour selected)')
+    figure.suptitle('Step 0 - isolating the board by colour')
+
+    # -----------------------------------------------------------------------
+    # Figure 2 - the binary mask, the traced contour, and the recovered corners
+    # -----------------------------------------------------------------------
+
+    # Draw the traced outline on its own copy of the original
+    contour_overlay = img.copy()
+    cv2.drawContours(contour_overlay, [board_contour], -1, (0, 255, 0), 12)
+
+    # Draw the four corners on another copy. The corners are reordered to
+    # UL, UR, LR, LL so that polylines traces the outline of the board rather
+    # than crossing over itself in a bow-tie.
+    corner_overlay = img.copy()
+    cv2.polylines(corner_overlay, [corners[[0, 1, 3, 2]].astype(np.int32)], True, (0, 255, 0), 8)
+    for x, y in corners:
+        cv2.circle(corner_overlay, (int(x), int(y)), 35, (0, 0, 255), -1)
+
+    figure, axes = plt.subplots(1, 3, figsize=(13, 6), layout='constrained')
+    show(axes[0], bin_board, 'Binary mask (after morphology)', gray=True)
+    show(axes[1], contour_overlay, 'Largest contour (%d points)' % len(board_contour))
+    show(axes[2], corner_overlay, 'Original with found corners')
+
+    # Label each corner on the third panel so the ordering can be checked by eye
+    for label, (x, y) in zip(['UL', 'UR', 'LL', 'LR'], corners):
+        axes[2].annotate(label, (x, y), color='yellow', fontsize=12, weight='bold',
+                         xytext=(12, 12), textcoords='offset points')
+
+    figure.suptitle('Steps 1 and 2 - binary mask, contour and corner detection')
+
+    # -----------------------------------------------------------------------
+    # Figure 3 - the original next to the rectified board
+    # -----------------------------------------------------------------------
+    warped_board, max_width, max_height = rectified_board(img, corners)
+
+    figure, axes = plt.subplots(1, 2, figsize=(12, 6), layout='constrained')
+    show(axes[0], img, 'Original (%d x %d)' % (img.shape[1], img.shape[0]))
+    show(axes[1], warped_board, 'Perspective corrected (%d x %d)' % (max_width, max_height))
+    figure.suptitle('Step 3 - rectifying the board with a perspective transform')
+
+    # -----------------------------------------------------------------------
+    # Figure 4 - locating the 42 cells, two ways
+    # -----------------------------------------------------------------------
+    hough_img, hough_circles = circle_encoder(warped_board)
+    mask_img, mask_centres = find_cells_by_mask(warped_board)
+    n_hough = 0 if hough_circles is None else len(hough_circles)
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 6), layout='constrained')
+    show(axes[0], hough_img, 'HoughCircles (%d / 42 found)' % n_hough)
+    show(axes[1], mask_img, 'Mask inversion (%d / 42 found)' % len(mask_centres))
+    figure.suptitle('Step 4 - locating the 42 cells')
+
+    # -----------------------------------------------------------------------
+    # Figure 5 - the grid assignment and the colour read off each cell
+    # -----------------------------------------------------------------------
+    grid = assign_cells_to_grid(mask_centres, warped_board.shape)
+    estimated_state = encode_board_state(warped_board, mask_centres)
+    true_state = np.array(board_groundtruth[demo_name])
+
+    # Draw the cell boundaries and label every opening with its grid position
+    grid_overlay = warped_board.copy()
+    cell_width = warped_board.shape[1] / 7
+    cell_height = warped_board.shape[0] / 6
+    for column in range(1, 7):
+        x = int(column * cell_width)
+        cv2.line(grid_overlay, (x, 0), (x, warped_board.shape[0]), (0, 255, 255), 4)
+    for row in range(1, 6):
+        y = int(row * cell_height)
+        cv2.line(grid_overlay, (0, y), (warped_board.shape[1], y), (0, 255, 255), 4)
+    for row in range(6):
+        for column in range(7):
+            index = grid[row, column]
+            if index >= 0:
+                x, y = mask_centres[index]
+                cv2.circle(grid_overlay, (int(x), int(y)), 8, (0, 0, 255), -1)
+                cv2.putText(grid_overlay, '%d,%d' % (row, column), (int(x) - 55, int(y) + 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 4)
+
+    # Draw the decoded state as a schematic board
+    swatches = {0: (0.90, 0.90, 0.90), 1: (0.95, 0.80, 0.10), 2: (0.85, 0.15, 0.15)}
+    figure, axes = plt.subplots(1, 2, figsize=(13, 6), layout='constrained')
+    show(axes[0], grid_overlay, 'Cells assigned to the 6 x 7 grid')
+
+    axes[1].set_xlim(-0.5, 6.5)
+    axes[1].set_ylim(5.5, -0.5)
+    axes[1].set_aspect('equal')
+    axes[1].set_xticks(range(7))
+    axes[1].set_yticks(range(6))
+    for row in range(6):
+        for column in range(7):
+            value = int(estimated_state[row, column])
+            axes[1].add_patch(plt.Circle((column, row), 0.42, color=swatches[value],
+                                         ec='0.3'))
+            # Ring any cell that disagrees with the ground truth
+            if value != true_state[row, column]:
+                axes[1].add_patch(plt.Circle((column, row), 0.47, fill=False,
+                                             ec='magenta', lw=3))
+    correct_cells = int((estimated_state == true_state).sum())
+    axes[1].set_title('Decoded board state (%d/42 cells correct)' % correct_cells)
+    figure.suptitle('Steps 5 and 6 - grid assignment and colour encoding for %s' % demo_name)
+
+    plt.show()

@@ -928,29 +928,287 @@ to within a few pixels.
 
 ---
 
+### Step 3 — Rectifying the board
+
+With four ordered corners in hand, the board is warped to a fronto-parallel
+view. `cv2.getPerspectiveTransform` builds the 3×3 homography that maps the four
+detected corners onto the four corners of a rectangle, and `cv2.warpPerspective`
+applies it.
+
+The output rectangle is sized from the board as it appears in the photograph
+rather than from a fixed constant: the width is the longer of the top and bottom
+edges, the height the longer of the left and right edges. Taking the longer of
+each pair means no part of the board is squeezed below its original sampling
+density, so the warp never throws away detail it could have kept.
+
+```python
+max_width  = int(max(np.linalg.norm(corners[1] - corners[0]),   # top edge
+                     np.linalg.norm(corners[3] - corners[2])))  # bottom edge
+max_height = int(max(np.linalg.norm(corners[2] - corners[0]),   # left edge
+                     np.linalg.norm(corners[3] - corners[1])))  # right edge
+
+output_pts = np.array([[0, 0], [max_width - 1, 0],
+                       [0, max_height - 1], [max_width - 1, max_height - 1]],
+                      dtype=np.float32)
+M = cv2.getPerspectiveTransform(corners, output_pts)
+warped_board = cv2.warpPerspective(img, M, (max_width, max_height))
+```
+
+The `output_pts` ordering must match the `find_board_corners` ordering
+(UL, UR, LL, LR) exactly — swapping any two entries produces a mirrored or
+bow-tied warp, which is the most common way to get this step wrong.
+
+One consequence of sizing from the observed edges is that the result is **not**
+forced to the board's true 7:6 aspect ratio. Under oblique views the rectified
+board comes out stretched, which matters in the next step.
+
+| Image | Warped size | Cell pitch | Mean cell elongation |
+|---|---|---|---|
+| 001 | 1702 × 994 | 166 | 1.52 |
+| 002 | 1877 × 1117 | 186 | 1.38 |
+| 003 | 1962 × 1491 | 248 | 1.12 |
+| 004 | 1714 × 1059 | 176 | 1.34 |
+| 005 | 1624 × 1214 | 202 | 1.07 |
+| 006 | 1348 × 938 | 156 | 1.13 |
+| 007 | 2090 × 1449 | 242 | 1.20 |
+| 008 | 2435 × 1618 | 270 | 1.20 |
+| 009 | 1325 × 949 | 158 | 1.08 |
+| 010 | 1516 × 1051 | 175 | 1.20 |
+| 011 | 1691 × 1158 | 193 | 1.22 |
+| 012 | 1613 × 1161 | 194 | 1.27 |
+| 013 | 1676 × 1347 | 224 | 1.12 |
+| 014 | 2040 × 1155 | 192 | 1.57 |
+| 015 | 1419 × 931 | 155 | 1.32 |
+
+Elongation here is the ratio of major to minor axis of an ellipse fitted to each
+cell opening, averaged over the 42 cells. A perfectly rectified board would give
+1.00. The values range from 1.07 to 1.57, so the openings are close to circular
+on some images and clearly elliptical on others.
+
+---
+
+### Step 4 — Locating the 42 cells
+
+Two methods were implemented and compared.
+
+#### 4a — `HoughCircles` (`circle_encoder`)
+
+The obvious approach: the openings are round, so look for circles.
+
+The parameter that matters most is the radius range, and it must be **derived
+from the geometry, not hard coded**. A rectified board is exactly 7 cells wide
+and 6 tall, so the cell pitch follows from the image size, and an opening is a
+little under two thirds of a pitch across:
+
+```python
+cell_pitch      = min(img.shape[1] / 7, img.shape[0] / 6)
+expected_radius = 0.30 * cell_pitch
+
+circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.2,
+                           minDist=int(0.70 * cell_pitch),
+                           param1=100, param2=40,
+                           minRadius=int(0.75 * expected_radius),
+                           maxRadius=int(1.35 * expected_radius))
+```
+
+The pitch varies from 155 to 270 px across the fifteen images depending on how
+close the camera was, a factor of 1.7, so a fixed radius range tuned on one
+image cannot work on the set. `minDist` is set just below one pitch so that two
+detections can never be reported inside a single cell. A `cv2.medianBlur(gray, 9)`
+precedes the transform to suppress the wood grain visible through the empty
+openings, which otherwise contributes spurious edge votes.
+
+#### 4b — Inverting the colour mask (`find_cells_by_mask`)
+
+The second approach uses no shape model at all. Every opening is a *hole* in the
+blue plastic, so whatever inside the board outline is **not** selected by the
+board colour threshold is a cell. The colour mask already exists from Step 0, so
+this is nearly free:
+
+```python
+board_mask = (histogram_color_select(warped_board).any(axis=2)).astype(np.uint8) * 255
+holes = cv2.bitwise_not(board_mask)
+
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+holes = cv2.morphologyEx(holes, cv2.MORPH_OPEN, kernel)
+
+contours, _ = cv2.findContours(holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+contours = [c for c in contours if cv2.contourArea(c) > 0.10 * cell_area]
+```
+
+The opening removes the thin sliver of non-board pixels around the border of the
+warp and any speckle; the area filter drops anything too small to be a real
+cell. Centres come from the contour moments, `m10/m00` and `m01/m00`.
+
+#### Comparison
+
+| Image | Elongation | Hough cells | Mask cells |
+|---|---|---|---|
+| 001 | 1.52 | 39 | **42** |
+| 002 | 1.38 | 42 | **42** |
+| 003 | 1.12 | 42 | **42** |
+| 004 | 1.34 | 37 | **42** |
+| 005 | 1.07 | 42 | **42** |
+| 006 | 1.13 | 42 | **42** |
+| 007 | 1.20 | 42 | **42** |
+| 008 | 1.20 | 42 | **42** |
+| 009 | 1.08 | 40 | **42** |
+| 010 | 1.20 | 42 | **42** |
+| 011 | 1.22 | 42 | **42** |
+| 012 | 1.27 | 42 | **42** |
+| 013 | 1.12 | 42 | **42** |
+| 014 | 1.57 | 43 | **42** |
+| 015 | 1.32 | 41 | **42** |
+| **Perfect** | | **10 / 15** | **15 / 15** |
+
+The Hough failures cluster on the most distorted boards — 014 (elongation 1.57,
+finds a spurious 43rd circle), 001 (1.52), 002/004 (1.34–1.38), 015 (1.32) — which
+is exactly what a circle detector should do when the targets are ellipses.
+`HOUGH_GRADIENT` fits circles only; there is no ellipse variant in OpenCV.
+
+**Mask inversion is used in the pipeline.** It does not assume a shape, so the
+residual elongation from Step 3 costs it nothing, and it reuses work already
+done rather than running a second global search over the image. `circle_encoder`
+is retained for the comparison above.
+
+---
+
+### Step 5 — Assigning cells to the 6 × 7 grid
+
+After rectification the board is an axis-aligned rectangle exactly 7 cells wide
+and 6 tall, so a detection's grid position follows directly from where it falls:
+
+```python
+cell_width  = width / 7
+cell_height = height / 6
+
+grid = np.full((6, 7), -1, np.int32)
+for index, (x, y) in enumerate(centres):
+    column = int(np.clip(x // cell_width,  0, 6))
+    row    = int(np.clip(y // cell_height, 0, 5))
+    grid[row, column] = index
+```
+
+`grid` holds an index into `centres` for each position, or `-1` where nothing
+was detected. Row 0 is the top of the board and column 0 the left, matching
+`board_states.pkl`.
+
+The alternative — sort the 42 centres by *y*, chop into six groups of seven,
+sort each group by *x* — was rejected. It assumes all 42 detections are present
+and correct: a single missing cell shifts every later detection one place along
+and corrupts the whole board rather than just one entry. Binning by position
+degrades gracefully, because each detection is placed independently of every
+other one. The `-1` entries left by a missed detection default to empty, which is
+the right guess: a cell with a token in it is a solid disc of strong colour and
+is the easiest kind of cell to detect, so a missed detection is far more likely
+to have been an empty one.
+
+Clipping guards the case of a centre landing a pixel outside the warp, which
+would otherwise index off the end of the array.
+
+---
+
+### Step 6 — Reading the colour of each cell
+
+A disc of radius `0.20 × cell_pitch` is taken from the middle of each opening and
+reduced to one representative colour with the **median**. The median is chosen
+over the mean deliberately: it ignores the specular highlight on the glossy token
+and the shadow around the rim of the opening, both of which would drag a mean
+away from the token's true colour.
+
+The decision is then made in HSV on two gates:
+
+```python
+if saturation < 150:
+    return 0                       # empty
+
+hue_distance_to_red = min(hue, 180 - hue)
+if hue_distance_to_red <= 6:
+    return 2                       # red
+if 20 <= hue <= 40:
+    return 1                       # yellow
+
+return 0
+```
+
+Hue is measured as a **distance around the colour circle** rather than as a plain
+range, because red straddles the 0/180 wrap-around point in OpenCV's packing and
+so appears at both ends of the axis. A naive `hue < 10` test loses every red
+token that quantises to 178 or 179.
+
+The thresholds come from measuring all 630 cells of the validation set:
+
+| Class | n | Hue | Distance to red | Saturation |
+|---|---|---|---|---|
+| Empty | 358 | 12–99 | 12–89 | 8–177 |
+| Yellow | 137 | 25–31 | 25–31 | 206–238 |
+| Red | 135 | 0–2, 178–179 | 0–2 | 172–238 |
+
+**Both gates are necessary, and each one covers the other's blind spot.**
+
+- Saturation alone cannot separate *empty* from *red*. The wooden table seen
+  through an empty opening reaches saturation 177 while the darkest red token
+  sits at 172 — the two populations overlap. Their hues, however, are at least
+  12 apart, so the hue gate separates them cleanly.
+- Hue alone cannot separate *empty* from *yellow*. 38 of the 358 empty cells have
+  a hue inside the yellow band, because bare wood is a yellow-orange colour. But
+  every one of those is washed out to below saturation 150, whereas no yellow
+  token falls below 206, so the saturation gate separates them cleanly.
+
+The thresholds sit in the middle of wide gaps (red boundary 6, against measured
+extremes of 2 and 12; saturation boundary 150, against 177 and 206), so they are
+not finely tuned to this particular set.
+
+An earlier version used `hue_distance_to_red <= 12`, which put the boundary
+exactly on the edge of the empty population and misclassified one cell — the
+bottom-left of `015.jpg`, where bare table shows through at hue 12, saturation
+177, the single most saturated empty cell in the whole set. Tightening to 6 fixed
+it, and the measured margins show it was not an arbitrary adjustment.
+
+---
+
+### Results
+
+Running `mainQ2.py` over the fifteen validation images:
+
+| Image | Board accuracy |
+|---|---|
+| 001 – 015 | 100.00 % (42/42 cells each) |
+
+```
+Average Board Accuracy: 100.00 %
+Overall Accuracy:       100.00 % (15/15 boards fully correct)
+```
+
+Every one of the 630 cells across the fifteen images is recovered correctly, with
+no ground-truth corners used anywhere — the pipeline runs end to end from the raw
+photograph. `board_corners.pkl` was used only to validate Step 2 in isolation.
+
+---
+
 ### Status
 
-Implemented in `mainQ2.py`:
+`mainQ2.py` implements the full pipeline:
 
-- `histogram_color_select` — per-image adaptive HSV threshold isolating the board
-- `morphological_operations` — opening/closing cleanup of the binary mask
-- `find_board_corners` — contour → quadrilateral → ordered corners
-- `show` — display helper that scales the 3472×2598 images down to fit on screen
+| Function | Step | Role |
+|---|---|---|
+| `histogram_color_select` | 0 | per-image adaptive HSV threshold isolating the board |
+| `morphological_operations` | 1 | opening/closing cleanup of the binary mask |
+| `find_board_corners` | 2 | contour → quadrilateral → ordered corners |
+| `rectified_board` | 3 | perspective transform to a fronto-parallel view |
+| `circle_encoder` | 4a | `HoughCircles` cell detection (comparison only) |
+| `find_cells_by_mask` | 4b | cell detection by inverting the board colour mask |
+| `assign_cells_to_grid` | 5 | detections → positions in the 6 × 7 grid |
+| `classify_cell_colour` | 6 | one cell → empty / yellow / red |
+| `encode_board_state` | 5–6 | rectified board + centres → 6 × 7 state array |
+| `board_state_from_image` | all | **the deliverable**: colour image → 6 × 7 state array |
+| `show` | — | matplotlib display helper |
 
-Still to do:
-
-1. `cv2.getPerspectiveTransform` and `cv2.warpPerspective` to rectify the board
-   to a fronto-parallel view using the detected corners;
-2. sampling each of the 42 cells in the rectified image and classifying it as
-   empty / yellow / red by colour;
-3. the accuracy reporting the brief requires — per-image board accuracy, average
-   board accuracy across all images, and overall accuracy (the percentage of
-   images with all 42 cells correct).
-
-An exploratory prototype of stages 1 and 2 — warping to 700×600, sampling a disc
-at each cell centre and classifying by hue with a saturation gate — reached
-**99.5% cell accuracy with 14 of 15 boards perfect** using the detected corners.
-That figure is indicative only and is not yet part of `mainQ2.py`.
+`board_state_from_image` is the function the brief asks for: it takes a numpy
+array holding the colour image and returns a 6 × 7 numpy array of 0 (empty),
+1 (yellow) and 2 (red). Running the module as a script prints the per-image
+board accuracy, the average board accuracy and the overall accuracy, then draws
+five figures walking one image through the pipeline.
 
 ---
 
