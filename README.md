@@ -666,12 +666,45 @@ Two details matter here:
   in a `uint8` at 2° per step. The histogram is therefore built with 180 bins over
   `[0, 180]`. Using 256 bins over `[0, 256]` leaves 76 bins permanently empty.
 - **`np.argmax` over a slice returns an index into the slice**, not into the
-  original array. `np.argmax(hist_h[100:140])` returns a number in 0–39, so the
+  original array. `np.argmax(hist_h[90:140])` returns a number in 0–49, so the
   slice start must be added back on to recover the true hue bin. Omitting this
   silently yields a hue in the wrong part of the spectrum entirely.
 
+- **The search range must not clip the peak.** This was originally
+  `blue_hue_range = (100, 140)`, and it reported a peak of 100–102 on all fifteen
+  images, which looked convincingly stable. Plotting the histogram showed why:
+  the board's blue actually peaks at **94–98**, so the range was starting *above*
+  the peak and `argmax` was returning the boundary bin itself on every image. The
+  detection still worked, but only because the ±10 window placed around the
+  reported peak reached back far enough to cover the real one — a margin of 4–8
+  hue units that nothing had been designed to guarantee. Widening the range to
+  `(90, 140)` finds the true peak; accuracy is unchanged at 15/15, but the result
+  is no longer resting on a coincidence.
+
 This step is reliable: across all 15 images the recovered peak hue lands in a
-range of just **100–102**.
+range of just **94–98**.
+
+#### Plotting the histograms
+
+`plot_color_histograms` draws all three histograms with the thresholds derived
+from them marked on top, alongside the image they came from (Figure 1). To keep
+the plot and the mask from drifting apart, the measurement was split out of
+`histogram_color_select` into `board_color_bounds`, which returns the HSV bounds
+together with a `stats` dict holding the histograms and every threshold. Both
+the masking and the plotting call it, so the figure can only ever show the
+numbers actually used.
+
+The hue and saturation panels use a log count axis: the background outnumbers
+the board by orders of magnitude and would otherwise flatten its peak into the
+axis. The saturation panel overlays two histograms — every blue-hued pixel in
+grey, and what survives the Otsu split in blue — which makes the wall-versus-board
+problem described below visible directly as two separated modes.
+
+This was not decoration. The clipped hue search range above had been in the code
+since the first version and was invisible in the numbers, because a peak pinned
+to the edge of a search window looks exactly like a genuinely stable measurement.
+It took one glance at the plot to see the marker sitting on the shoulder of the
+spike rather than on top of it.
 
 #### Why the saturation peak needs Otsu
 
@@ -924,7 +957,7 @@ counterpart, in pixels, on 3472×2598 images:
 | 004 | 34.7 | 17.1 | 1.4 | 5.7 | 14.7 |
 | 005 | 2.2 | 4.1 | 1.0 | 5.8 | 3.3 |
 | 006 | 11.4 | 1.0 | 2.0 | 8.6 | 5.8 |
-| 007 | 23.7 | 3.2 | 3.2 | 16.3 | 11.6 |
+| 007 | 23.7 | 3.2 | 3.2 | 12.0 | 10.5 |
 | 008 | 11.4 | 2.2 | 1.4 | 7.2 | 5.6 |
 | 009 | 6.4 | 1.4 | 1.4 | 6.4 | 3.9 |
 | 010 | 8.6 | 1.4 | 1.0 | 9.9 | 5.2 |
@@ -934,12 +967,12 @@ counterpart, in pixels, on 3472×2598 images:
 | 014 | 35.4 | 2.2 | 2.2 | 13.0 | 13.2 |
 | 015 | 14.1 | 5.0 | 1.4 | 7.2 | 6.9 |
 
-**Mean 9.1 px, worst image 20.2 px** — approximately 0.3% of the board's width,
+**Mean 9.0 px, worst image 20.2 px** — approximately 0.3% of the board's width,
 and a small fraction of a cell, so the error is well within tolerance for
 locating cells.
 
 The error is **systematically worse at the top of the board**: the two upper
-corners average 12.6 px against 5.5 px for the two lower ones, and every large
+corners average 12.6 px against 5.4 px for the two lower ones, and every large
 outlier in the table is a UL or UR entry. This is not random noise. The physical
 board has a raised lip around the token entry slot along its top edge, so the
 detected contour follows the true silhouette of the plastic while the
@@ -1189,13 +1222,65 @@ it, and the measured margins show it was not an arbitrary adjustment.
 
 ---
 
+### Scoring — `board_detection_accuracy`
+
+`board_detection_accuracy(img, true_state, true_corners)` runs the pipeline on
+one image and scores it. The headline number is the **Board Accuracy** the brief
+defines, the percentage of the 42 cells identified correctly, but it also reports
+two diagnostics, because when a board comes out wrong it is almost always one of
+these that explains it rather than the colour classification:
+
+- **`cells_detected`** — how many openings Step 4 found. Anything short of 42
+  means a cell was never examined at all and was left at its default of empty, so
+  a board can lose accuracy without a single colour decision being wrong.
+- **`corner_error`** — the mean distance in pixels between the four detected
+  corners and the hand-labelled ones. A large value means Step 3 was handed a bad
+  quadrilateral, which shifts every cell centre at once and can misalign the
+  whole grid rather than just one cell.
+
+Separating these matters because the three failure modes need different fixes,
+and the final accuracy alone cannot tell them apart.
+
+To reach the intermediate corners the function needs the middle of the pipeline,
+which would have meant a second copy of it. Instead the geometric stages were
+factored into **`detect_board`**, returning the rectified board, the corners and
+the cell centres; `board_state_from_image` and `board_detection_accuracy` both
+call it, so the scoring can never measure a pipeline different from the one that
+produced the answer. This is the same argument as splitting `board_color_bounds`
+out for the histogram plot.
+
+The ground-truth corners are optional. `board_state_from_image` uses no
+validation data whatsoever — `corner_error` is a measurement *of* the pipeline,
+never an input to it.
+
+---
+
 ### Results
 
 Running `mainQ2.py` over the fifteen validation images:
 
-| Image | Board accuracy |
-|---|---|
-| 001 – 015 | 100.00 % (42/42 cells each) |
+| Image | Cells detected | Corner error (px) | Board accuracy |
+|---|---|---|---|
+| 001 | 42/42 | 18.5 | 100.00 % |
+| 002 | 42/42 | 20.2 | 100.00 % |
+| 003 | 42/42 | 5.6 | 100.00 % |
+| 004 | 42/42 | 14.7 | 100.00 % |
+| 005 | 42/42 | 3.3 | 100.00 % |
+| 006 | 42/42 | 5.8 | 100.00 % |
+| 007 | 42/42 | 10.5 | 100.00 % |
+| 008 | 42/42 | 5.6 | 100.00 % |
+| 009 | 42/42 | 3.9 | 100.00 % |
+| 010 | 42/42 | 5.2 | 100.00 % |
+| 011 | 42/42 | 12.4 | 100.00 % |
+| 012 | 42/42 | 4.2 | 100.00 % |
+| 013 | 42/42 | 5.0 | 100.00 % |
+| 014 | 42/42 | 13.2 | 100.00 % |
+| 015 | 42/42 | 6.9 | 100.00 % |
+
+Worth noting that the two worst corner errors, 001 at 18.5 px and 002 at 20.2 px,
+still give perfect boards. A cell pitch is 155–270 px, so even a 20 px corner
+error moves a cell centre by well under a tenth of a cell, and the disc sampled
+for classification stays comfortably inside the right opening.
 
 ```
 Average Board Accuracy: 100.00 %
@@ -1214,7 +1299,9 @@ photograph. `board_corners.pkl` was used only to validate Step 2 in isolation.
 
 | Function | Step | Role |
 |---|---|---|
-| `histogram_color_select` | 0 | per-image adaptive HSV threshold isolating the board |
+| `board_color_bounds` | 0 | derives the per-image HSV window and returns the histograms behind it |
+| `histogram_color_select` | 0 | applies that window to isolate the board |
+| `plot_color_histograms` | 0 | draws the hue/saturation/value histograms with their thresholds |
 | `morphological_operations` | 1 | opening/closing cleanup of the binary mask |
 | `find_board_corners` | 2 | contour → quadrilateral → ordered corners |
 | `rectified_board` | 3 | perspective transform to a fronto-parallel view |
@@ -1223,7 +1310,9 @@ photograph. `board_corners.pkl` was used only to validate Step 2 in isolation.
 | `assign_cells_to_grid` | 5 | detections → positions in the 6 × 7 grid |
 | `classify_cell_colour` | 6 | one cell → empty / yellow / red |
 | `encode_board_state` | 5–6 | rectified board + centres → 6 × 7 state array |
+| `detect_board` | 0–4 | photograph → rectified board, corners and cell centres |
 | `board_state_from_image` | all | **the deliverable**: colour image → 6 × 7 state array |
+| `board_detection_accuracy` | — | per-image scoring against the validation data |
 | `show` | — | matplotlib display helper |
 
 `board_state_from_image` is the function the brief asks for: it takes a numpy

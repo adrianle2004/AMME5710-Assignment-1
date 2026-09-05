@@ -12,28 +12,38 @@ with open('assign1Q2_validationdata/board_corners.pkl', 'rb') as f:
 with open('assign1Q2_validationdata/board_states.pkl', 'rb') as f:
     board_groundtruth = pickle.load(f)
 
-def histogram_color_select(frame: np.ndarray) -> np.ndarray:
+def board_color_bounds(frame: np.ndarray) -> tuple:
     """
-    Selects the color of the board in the given frame using histogram-based color selection.
+    Works out the HSV window that isolates the board in a single frame.
+
+    This is the measurement half of the colour selection, split out from the
+    masking so that the same numbers can be plotted as histograms without being
+    recomputed by a second, possibly divergent, copy of the logic.
 
     Args:
         frame (np.ndarray): The input BGR image frame.
 
     Returns:
-        np.ndarray: The input frame with everything outside the selected colour
-            range masked out (still in BGR).
+        tuple: (lower_bound, upper_bound, stats) where the bounds are uint8 HSV
+            triples suitable for cv2.inRange, and stats is a dict holding the
+            histograms and the thresholds derived from them, for plotting.
     """
     # Convert the frame to HSV color space
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     # Calculate the hue histogram. OpenCV packs hue into 0-179 so that it fits
     # in a uint8, whereas saturation and value use the full 0-255.
-    hist_h = cv2.calcHist([hsv_frame], [0], None, [180], [0, 180])
+    hist_hue = cv2.calcHist([hsv_frame], [0], None, [180], [0, 180]).ravel()
 
     # Find the peak hue within the blue range. argmax over the slice is an index
     # into the slice, so the slice start is added back on to get the hue bin.
-    blue_hue_range = (100, 140)  # Approximate hue range for blue color
-    peak_hue = blue_hue_range[0] + int(np.argmax(hist_h[blue_hue_range[0]:blue_hue_range[1]]))
+    # The lower edge sits at 90 rather than 100 because the board's blue actually
+    # peaks at hue 94-98 across the fifteen images. A range starting at 100
+    # clipped that peak and reported the boundary bin itself as the maximum on
+    # every image, which happened to still work only because the +/-10 window
+    # placed around it reached back far enough to cover the real peak.
+    blue_hue_range = (90, 140)  # Approximate hue range for blue color
+    peak_hue = blue_hue_range[0] + int(np.argmax(hist_hue[blue_hue_range[0]:blue_hue_range[1]]))
     hue_lo, hue_hi = max(peak_hue - 10, 0), min(peak_hue + 10, 179)
 
     # The wall behind the board shares the board's hue but is washed out, and it
@@ -51,8 +61,10 @@ def histogram_color_select(frame: np.ndarray) -> np.ndarray:
     # Measure the saturation and value peaks over the saturated blue pixels only
     board_mask = cv2.inRange(hsv_frame, np.array([hue_lo, int(sat_split), 0], np.uint8),
                              np.array([hue_hi, 255, 255], np.uint8))
-    peak_saturation = int(np.argmax(cv2.calcHist([hsv_frame], [1], board_mask, [256], [0, 256])))
-    peak_value = int(np.argmax(cv2.calcHist([hsv_frame], [2], board_mask, [256], [0, 256])))
+    hist_saturation = cv2.calcHist([hsv_frame], [1], board_mask, [256], [0, 256]).ravel()
+    hist_value = cv2.calcHist([hsv_frame], [2], board_mask, [256], [0, 256]).ravel()
+    peak_saturation = int(np.argmax(hist_saturation))
+    peak_value = int(np.argmax(hist_value))
 
     # Create a mask based on the identified peak values. The value window is kept
     # wide because brightness varies a lot across the board with shading, while
@@ -64,12 +76,121 @@ def histogram_color_select(frame: np.ndarray) -> np.ndarray:
     upper_bound = np.array([hue_hi,
                             min(peak_saturation + 60, 255),
                             min(peak_value + 100, 255)], np.uint8)
-    mask = cv2.inRange(hsv_frame, lower_bound, upper_bound)
+
+    # The saturation of every blue-hued pixel, before the Otsu split throws the
+    # wall away. Kept only so the plot can show the two populations side by side.
+    hist_blue_saturation = cv2.calcHist([hsv_frame], [1], hue_mask, [256], [0, 256]).ravel()
+
+    stats = {'hsv_frame': hsv_frame,
+             'hist_hue': hist_hue,
+             'blue_hue_range': blue_hue_range,
+             'peak_hue': peak_hue,
+             'hue_lo': hue_lo,
+             'hue_hi': hue_hi,
+             'hist_blue_saturation': hist_blue_saturation,
+             'hist_saturation': hist_saturation,
+             'hist_value': hist_value,
+             'sat_split': int(sat_split),
+             'peak_saturation': peak_saturation,
+             'peak_value': peak_value}
+
+    return lower_bound, upper_bound, stats
+
+
+def histogram_color_select(frame: np.ndarray) -> np.ndarray:
+    """
+    Selects the color of the board in the given frame using histogram-based color selection.
+
+    Args:
+        frame (np.ndarray): The input BGR image frame.
+
+    Returns:
+        np.ndarray: The input frame with everything outside the selected colour
+            range masked out (still in BGR).
+    """
+    lower_bound, upper_bound, stats = board_color_bounds(frame)
+    mask = cv2.inRange(stats['hsv_frame'], lower_bound, upper_bound)
 
     # Apply the mask to the original frame to extract the selected color
     board = cv2.bitwise_and(frame, frame, mask=mask)
 
     return board
+
+
+def plot_color_histograms(axes: dict, frame: np.ndarray) -> None:
+    """
+    Draws the three histograms that the colour selection is built from, with the
+    thresholds it derived marked on them.
+
+    The hue panel shows where the blue peak was found; the saturation panel shows
+    the two populations of blue-hued pixels, the wall and the board, and the Otsu
+    split that separates them; the value panel shows the brightness spread of the
+    board itself. On each, the shaded band is the window that ends up being
+    passed to cv2.inRange.
+
+    Args:
+        axes (dict): Matplotlib axes keyed 'hue', 'saturation' and 'value'.
+        frame (np.ndarray): The input BGR image frame.
+    """
+    lower_bound, upper_bound, stats = board_color_bounds(frame)
+
+    # --- hue -------------------------------------------------------------
+    # Plotted on a log scale because the background dominates the count by
+    # orders of magnitude and would otherwise flatten the board's peak to
+    # nothing.
+    axis = axes['hue']
+    axis.bar(np.arange(180), stats['hist_hue'], width=1.0, color='0.65')
+    axis.axvspan(stats['blue_hue_range'][0], stats['blue_hue_range'][1],
+                 color='tab:blue', alpha=0.10, label='blue search range')
+    axis.axvspan(stats['hue_lo'], stats['hue_hi'], color='tab:blue', alpha=0.30,
+                 label='accepted window %d-%d' % (stats['hue_lo'], stats['hue_hi']))
+    axis.axvline(stats['peak_hue'], color='tab:red', lw=1.5,
+                 label='peak hue = %d' % stats['peak_hue'])
+    axis.set_yscale('log')
+    axis.set_xlim(0, 179)
+    axis.set_xlabel('hue (OpenCV 0-179)')
+    axis.set_ylabel('pixels (log)')
+    axis.set_title('Hue histogram (whole image)')
+    axis.legend(fontsize=7, loc='upper right')
+
+    # --- saturation ------------------------------------------------------
+    # The grey histogram is every blue-hued pixel and is clearly bimodal: the
+    # low mode is the wall, the high mode the board. The blue histogram is what
+    # survives the Otsu split, and it is only over those pixels that the peak is
+    # measured.
+    axis = axes['saturation']
+    axis.bar(np.arange(256), stats['hist_blue_saturation'], width=1.0,
+             color='0.65', label='all blue-hued pixels')
+    axis.bar(np.arange(256), stats['hist_saturation'], width=1.0,
+             color='tab:blue', label='kept after Otsu split')
+    axis.axvline(stats['sat_split'], color='tab:orange', lw=1.5,
+                 label='Otsu split = %d' % stats['sat_split'])
+    axis.axvspan(lower_bound[1], upper_bound[1], color='tab:blue', alpha=0.20,
+                 label='accepted window %d-%d' % (lower_bound[1], upper_bound[1]))
+    axis.axvline(stats['peak_saturation'], color='tab:red', lw=1.5,
+                 label='peak = %d' % stats['peak_saturation'])
+    axis.set_yscale('log')
+    axis.set_xlim(0, 255)
+    axis.set_xlabel('saturation')
+    axis.set_ylabel('pixels (log)')
+    axis.set_title('Saturation of blue-hued pixels')
+    axis.legend(fontsize=7, loc='upper right')
+
+    # --- value -----------------------------------------------------------
+    # Measured over the board pixels only. The window is deliberately wide
+    # because shading across the board moves brightness around a lot.
+    axis = axes['value']
+    axis.bar(np.arange(256), stats['hist_value'], width=1.0, color='tab:blue')
+    axis.axvspan(lower_bound[2], upper_bound[2], color='tab:blue', alpha=0.20,
+                 label='accepted window %d-%d' % (lower_bound[2], upper_bound[2]))
+    axis.axvline(stats['peak_value'], color='tab:red', lw=1.5,
+                 label='peak = %d' % stats['peak_value'])
+    axis.set_xlim(0, 255)
+    axis.set_xlabel('value')
+    axis.set_ylabel('pixels')
+    axis.set_title('Value over the board pixels')
+    axis.legend(fontsize=7, loc='upper right')
+
 
 def show(axis, image: np.ndarray, title: str, gray: bool = False) -> None:
     """
@@ -439,21 +560,24 @@ def encode_board_state(warped_board: np.ndarray, centres: np.ndarray) -> np.ndar
     return board_state
 
 
-def board_state_from_image(img: np.ndarray) -> np.ndarray:
+def detect_board(img: np.ndarray) -> tuple:
     """
-    Determines the state of the connect four board in a photograph.
+    Runs the geometric half of the pipeline on a photograph: isolate the board by
+    colour, clean the mask up with morphology, trace its outline and reduce it to
+    four corners, rectify it to a fronto-parallel view, and locate the 42
+    openings within it.
 
-    This runs the whole pipeline: isolate the board by colour, clean the mask up
-    with morphology, trace its outline and reduce it to four corners, rectify it
-    to a fronto-parallel view, find the 42 openings as holes in the board
-    colour, place them on the grid and read off each one's colour.
+    It is split out from board_state_from_image so that the accuracy measurement
+    can reach the intermediate corners without running a second copy of the
+    pipeline that could drift out of step with this one.
 
     Args:
         img (np.ndarray): A colour (BGR) photograph containing the board.
 
     Returns:
-        np.ndarray: A 6-by-7 int array of cell states, 0 empty, 1 yellow, 2 red,
-            with row 0 the top of the board and column 0 the left.
+        tuple: (warped_board, corners, centres) - the rectified board image, the
+            four detected corners ordered (UL, UR, LL, LR), and an N-by-2 array
+            of cell centres in the rectified image.
     """
     # Step 0 - isolate the board by its colour
     board = histogram_color_select(img)
@@ -467,10 +591,84 @@ def board_state_from_image(img: np.ndarray) -> np.ndarray:
     corners = find_board_corners(bin_board)
     warped_board, _, _ = rectified_board(img, corners)
 
-    # Step 4 and 5 - find the cells and read their colours
+    # Step 4 - find the cells
     _, centres = find_cells_by_mask(warped_board)
 
+    return warped_board, corners, centres
+
+
+def board_state_from_image(img: np.ndarray) -> np.ndarray:
+    """
+    Determines the state of the connect four board in a photograph.
+
+    This is the function the brief asks for: it runs the whole pipeline, from the
+    raw photograph through to the encoded board, using no validation data.
+
+    Args:
+        img (np.ndarray): A colour (BGR) photograph containing the board.
+
+    Returns:
+        np.ndarray: A 6-by-7 int array of cell states, 0 empty, 1 yellow, 2 red,
+            with row 0 the top of the board and column 0 the left.
+    """
+    warped_board, _, centres = detect_board(img)
+
+    # Step 5 and 6 - place the cells on the grid and read their colours
     return encode_board_state(warped_board, centres)
+
+
+def board_detection_accuracy(img: np.ndarray, true_state: np.ndarray,
+                             true_corners: np.ndarray = None) -> dict:
+    """
+    Measures how well the pipeline recovered the board in a single image.
+
+    The headline number is the Board Accuracy defined in the brief: the
+    percentage of the 42 cells whose state was identified correctly. Two
+    diagnostics are reported alongside it, because when a board comes out wrong
+    it is usually one of these that explains why rather than the colour
+    classification itself:
+
+    - "cells_detected", the number of openings Step 4 found. Anything short of 42
+      means a cell was never examined at all and was left at its default of
+      empty.
+    - "corner_error", the mean distance in pixels between the four detected
+      corners and the hand-labelled ones, if those are supplied. A large value
+      means the rectification was fed a bad quadrilateral, which shifts every
+      cell centre and can misalign the whole grid.
+
+    Args:
+        img (np.ndarray): A colour (BGR) photograph containing the board.
+        true_state (np.ndarray): The ground-truth 6-by-7 state for that image.
+        true_corners (np.ndarray): Optionally, the ground-truth 4-by-2 corners,
+            ordered (UL, UR, LL, LR), to measure the corner error against.
+
+    Returns:
+        dict: The estimated state, the number of cells correct, the board
+            accuracy as a percentage, whether the board was perfect, the number
+            of cells detected, and the corner error if it could be measured.
+    """
+    warped_board, corners, centres = detect_board(img)
+    estimated_state = encode_board_state(warped_board, centres)
+
+    true_state = np.asarray(true_state)
+    correct_cells = int((estimated_state == true_state).sum())
+
+    result = {'estimated_state': estimated_state,
+              'correct_cells': correct_cells,
+              'total_cells': int(true_state.size),
+              'board_accuracy': 100.0 * correct_cells / true_state.size,
+              'perfect': correct_cells == true_state.size,
+              'cells_detected': len(centres),
+              'corner_error': None}
+
+    # Mean Euclidean distance between corresponding corners. Both are in the
+    # same (UL, UR, LL, LR) order, so they can be subtracted row by row.
+    if true_corners is not None:
+        true_corners = np.asarray(true_corners, np.float32)
+        result['corner_error'] = float(
+            np.mean(np.linalg.norm(corners - true_corners, axis=1)))
+
+    return result
 
 
 if __name__ == '__main__':
@@ -481,21 +679,19 @@ if __name__ == '__main__':
     board_accuracies = []
     perfect_boards = 0
 
-    print('%-10s %-16s' % ('image', 'board accuracy'))
+    print('%-10s %-9s %-9s %s' % ('image', 'cells', 'corner px', 'board accuracy'))
     for name in image_names:
         img = cv2.imread(os.path.join('connect_four_images_A1', name))
-        estimated_state = board_state_from_image(img)
-        true_state = np.array(board_groundtruth[name])
+        result = board_detection_accuracy(img, board_groundtruth[name],
+                                          board_corners[name])
 
-        # Board Accuracy is the percentage of the 42 cells that are correct
-        correct_cells = int((estimated_state == true_state).sum())
-        board_accuracy = 100.0 * correct_cells / true_state.size
-        board_accuracies.append(board_accuracy)
-        if correct_cells == true_state.size:
-            perfect_boards += 1
+        board_accuracies.append(result['board_accuracy'])
+        perfect_boards += result['perfect']
 
-        print('%-10s %6.2f %%   (%d/%d cells)'
-              % (name, board_accuracy, correct_cells, true_state.size))
+        print('%-10s %2d/42     %6.1f    %6.2f %%   (%d/%d cells)'
+              % (name, result['cells_detected'], result['corner_error'],
+                 result['board_accuracy'], result['correct_cells'],
+                 result['total_cells']))
 
     # Average Board Accuracy is the mean of the per image accuracies, and
     # Overall Accuracy is the percentage of images recovered without a single
@@ -527,9 +723,14 @@ if __name__ == '__main__':
     # -----------------------------------------------------------------------
     # Figure 1 - the colour selection step
     # -----------------------------------------------------------------------
-    figure, axes = plt.subplots(1, 2, figsize=(9, 7), layout='constrained')
-    show(axes[0], img, 'Original')
-    show(axes[1], board, 'Board detection (colour selected)')
+    # The images go on the top row and the histograms they were derived from on
+    # the bottom, so the thresholds can be read against the result they produce.
+    mosaic = [['original', 'original', 'selected', 'selected'],
+              ['hue', 'hue', 'saturation', 'value']]
+    figure, axes = plt.subplot_mosaic(mosaic, figsize=(15, 9), layout='constrained')
+    show(axes['original'], img, 'Original')
+    show(axes['selected'], board, 'Board detection (colour selected)')
+    plot_color_histograms(axes, img)
     figure.suptitle('Step 0 - isolating the board by colour')
 
     # -----------------------------------------------------------------------
